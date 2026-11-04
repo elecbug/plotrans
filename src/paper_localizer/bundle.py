@@ -15,7 +15,7 @@ def figure_path(markdown_path: Path, reference: str) -> Path:
     base = markdown_path.parent.resolve()
     path = (base / reference).resolve()
     if not path.is_relative_to(base / "figs"):
-        raise ValueError("그림 경로는 figs 폴더 안에 있어야 합니다.")
+        raise ValueError("Figure paths must stay inside the figs directory.")
     return path
 
 
@@ -43,7 +43,7 @@ def _stylesheet_path(directory: Path, reference: str) -> Path:
     base = directory.resolve()
     path = (base / reference).resolve()
     if not path.is_relative_to(base / "assets"):
-        raise ValueError("스타일 경로는 assets 폴더 안에 있어야 합니다.")
+        raise ValueError("Stylesheet paths must stay inside the assets directory.")
     return path
 
 

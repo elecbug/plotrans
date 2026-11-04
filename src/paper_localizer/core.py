@@ -239,14 +239,14 @@ class OllamaClient:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 return json.load(response)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            raise ProcessingError(f"Ollama 연결 실패 ({self.base_url}): {exc}") from exc
+            raise ProcessingError(f"Cannot connect to Ollama ({self.base_url}): {exc}") from exc
 
     def check_models(self, *models: str) -> None:
         installed = {item.get("name") for item in self._request("/api/tags").get("models", [])}
         missing = [model for model in models if model not in installed]
         if missing:
             commands = "\n".join(f"ollama pull {model}" for model in missing)
-            raise ProcessingError(f"필요한 모델이 설치되지 않았습니다. 다음 명령을 실행하세요:\n{commands}")
+            raise ProcessingError(f"Required models are not installed. Run the following commands:\n{commands}")
 
     def chat(self, model: str, prompt: str, *, translation: bool = False) -> str:
         options = (
@@ -262,7 +262,7 @@ class OllamaClient:
         })
         answer = response.get("message", {}).get("content", "").strip()
         if not answer:
-            raise ProcessingError(f"{model}이(가) 빈 응답을 반환했습니다.")
+            raise ProcessingError(f"{model} returned an empty response.")
         return answer
 
 
@@ -283,7 +283,7 @@ def parse_pdf(pdf_path: Path, output_dir: Path | None = None, *, ocr: OcrOptions
     try:
         import opendataloader_pdf
     except ImportError as exc:
-        raise ProcessingError("opendataloader-pdf가 없습니다. `pip install -e .`을 실행하세요.") from exc
+        raise ProcessingError("opendataloader-pdf is not installed. Run `pip install -e .`.") from exc
     with tempfile.TemporaryDirectory(prefix="paper-localizer-") as directory:
         root = Path(directory)
         source = root / "paper.pdf"
@@ -296,17 +296,17 @@ def parse_pdf(pdf_path: Path, output_dir: Path | None = None, *, ocr: OcrOptions
                 image_output="external", image_format="png",
             )
         except Exception as exc:
-            raise ProcessingError(f"OpenDataLoader 변환 실패: {exc}") from exc
+            raise ProcessingError(f"OpenDataLoader conversion failed: {exc}") from exc
         result = output / "paper.json"
         if not result.exists():
-            raise ProcessingError("OpenDataLoader가 JSON 파일을 만들지 못했습니다. PDF 상태를 확인하세요.")
+            raise ProcessingError("OpenDataLoader did not produce a JSON file. Check the input PDF.")
         with result.open(encoding="utf-8") as file:
             document = json.load(file)
         try:
             destination = output_dir or Path("outputs")
             return prepare_document(pdf_path, document, destination, ocr=ocr)
         except Exception as exc:
-            raise ProcessingError(f"PDF/OCR·그림·수식 처리 실패: {exc}") from exc
+            raise ProcessingError(f"PDF/OCR, figure, or equation processing failed: {exc}") from exc
 
 
 def _translation_prompt(source: str, target_language: str) -> str:
@@ -355,7 +355,7 @@ def _translate_chunk(client: OllamaClient, model: str, source: str, language: st
                 translated = translated.replace(token, image)
             return translated
         prompt += "\n\nRequired unchanged placeholders: " + ", ".join(equations)
-    raise ProcessingError("번역 모델이 수식 표식을 누락하거나 중복했습니다. 청크 크기를 줄여 다시 실행하세요.")
+    raise ProcessingError("The translation model omitted or duplicated equation markers. Reduce the chunk size and retry.")
 
 
 def _summary_prompt(source: str, pages: tuple[int, ...], language: str,
@@ -418,13 +418,13 @@ def extract_pdf(pdf_path: Path, output_path: Path, *, chunk_size: int = 1800, oc
     """Write a source-only preview without requiring Ollama."""
     pdf_path, output_path = Path(pdf_path), Path(output_path)
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
-        raise ProcessingError("존재하는 PDF 파일을 지정하세요.")
+        raise ProcessingError("Specify an existing PDF file.")
     if output_path.suffix.lower() != ".md":
-        raise ProcessingError("출력 파일 확장자는 .md여야 합니다.")
+        raise ProcessingError("The output file must have a .md extension.")
     document = parse_pdf(pdf_path, output_path.parent, ocr=ocr)
     chunks = make_chunks(extract_blocks(document), chunk_size)
     if not chunks:
-        raise ProcessingError("추출한 본문 텍스트가 없습니다. 스캔 PDF라면 OCR 처리가 필요합니다.")
+        raise ProcessingError("No body text was extracted. Scanned PDFs may require OCR.")
     return write_article(document, _document_title(document, pdf_path.name), pdf_path.name,
                          chunks, None, "", "English", output_path)
 
@@ -442,23 +442,23 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
     pdf_path = Path(pdf_path)
     output_path = Path(output_path)
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
-        raise ProcessingError("존재하는 PDF 파일을 지정하세요.")
+        raise ProcessingError("Specify an existing PDF file.")
     if output_path.suffix.lower() != ".md":
-        raise ProcessingError("출력 파일 확장자는 .md여야 합니다.")
+        raise ProcessingError("The output file must have a .md extension.")
     if pdf_path.resolve() == output_path.resolve():
-        raise ProcessingError("출력 파일은 입력 PDF와 달라야 합니다.")
+        raise ProcessingError("The output file must differ from the input PDF.")
     with pdf_path.open("rb") as file:
         header = file.read(5)
     if header != b"%PDF-":
-        raise ProcessingError("PDF 헤더가 올바르지 않습니다.")
+        raise ProcessingError("The input file has an invalid PDF header.")
     client = client or OllamaClient(ollama_url)
     client.check_models(translation_model, summary_model)
     if progress:
-        progress("PDF 분석", 0, 1)
+        progress("Analyzing PDF", 0, 1)
     document = parser(pdf_path) if parser else parse_pdf(pdf_path, output_path.parent, ocr=ocr)
     blocks = extract_blocks(document)
     if not blocks:
-        raise ProcessingError("추출한 본문 텍스트가 없습니다. 스캔 PDF라면 OCR 처리가 필요합니다.")
+        raise ProcessingError("No body text was extracted. Scanned PDFs may require OCR.")
     chunks = make_chunks(blocks, chunk_size)
     with pdf_path.open("rb") as file:
         fingerprint = hashlib.file_digest(file, "sha256").hexdigest()
@@ -490,7 +490,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
         if index <= len(translations):
             continue
         if progress:
-            progress("번역 및 요약", index, len(chunks))
+            progress("Translating and summarizing", index, len(chunks))
         if chunk.kind in {"figure", "formula", "caption-image", "code"}:
             translations.append(chunk.source)
             from .markup import image_reference
@@ -508,7 +508,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
         checkpoint.write_text(json.dumps({"identity": identity, "translations": translations,
                                           "notes": notes}, ensure_ascii=False), encoding="utf-8")
     if progress:
-        progress("전체 요약", len(chunks), len(chunks))
+        progress("Combining summaries", len(chunks), len(chunks))
     summary = _combine_summary(notes, client, summary_model, target_language)
     write_article(document, _document_title(document, pdf_path.name), pdf_path.name,
                   chunks, translations, summary, target_language, output_path)

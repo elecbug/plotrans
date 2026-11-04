@@ -73,7 +73,7 @@ def _slug(text: str, used: set[str]) -> str:
 def build_article(document: dict, title: str, filename: str, chunks, translations=None,
                   summary: str = "", language: str = "English") -> Article:
     if translations is not None and len(translations) != len(chunks):
-        raise ValueError("원문과 번역 청크 수가 일치하지 않습니다.")
+        raise ValueError("The source and translation chunk counts do not match.")
     article = Article(title, filename, document.get("number of pages", "?"), language,
                       str(document.get("author") or ""), summary=summary, translated=translations is not None)
     if pages := document.get("source image pages"):

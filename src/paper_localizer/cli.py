@@ -21,7 +21,7 @@ def doctor(url: str, translation_model: str, summary_model: str, *, ocr: bool = 
         version = importlib.metadata.version("opendataloader-pdf")
         print(f"[OK] OpenDataLoader PDF {version}")
     except importlib.metadata.PackageNotFoundError:
-        print("[오류] opendataloader-pdf가 설치되지 않았습니다: pip install -e .")
+        print("[ERROR] opendataloader-pdf is not installed: pip install -e .")
         failures += 1
     java = shutil.which("java")
     if java:
@@ -30,40 +30,40 @@ def doctor(url: str, translation_model: str, summary_model: str, *, ocr: bool = 
             if result.returncode == 0:
                 print(f"[OK] Java: {(result.stderr or result.stdout).splitlines()[0]}")
             else:
-                print("[오류] Java 실행에 실패했습니다.")
+                print("[ERROR] Java failed to run.")
                 failures += 1
         except (OSError, subprocess.TimeoutExpired):
-            print("[오류] Java 실행에 실패하거나 10초 안에 응답하지 않았습니다.")
+            print("[ERROR] Java failed to run or did not respond within 10 seconds.")
             failures += 1
     else:
-        print("[오류] Java 11+가 PATH에 없습니다.")
+        print("[ERROR] Java 11+ was not found on PATH.")
         failures += 1
     if ocr:
         try:
             model_paths()
             print("[OK] Local CPU OCR: RapidOCR 3.10.0 / ONNX Runtime 1.23.2; 3 bundled model checksums verified")
         except OcrError as exc:
-            print(f"[오류] {exc}"); failures += 1
+            print(f"[ERROR] {exc}"); failures += 1
     if not skip_ollama:
         try:
             OllamaClient(url, timeout=10).check_models(translation_model, summary_model)
-            print(f"[OK] Ollama 및 모델: {translation_model}, {summary_model}")
+            print(f"[OK] Ollama and models: {translation_model}, {summary_model}")
         except ProcessingError as exc:
-            print(f"[오류] {exc}")
+            print(f"[ERROR] {exc}")
             failures += 1
     if vision_model:
         try:
             OllamaClient(url, timeout=10).check_models(vision_model)
             print(f"[OK] Local vision OCR model: {vision_model}")
         except ProcessingError as exc:
-            print(f"[오류] {exc}"); failures += 1
+            print(f"[ERROR] {exc}"); failures += 1
     return 1 if failures else 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="논문 PDF를 로컬에서 요약·번역합니다.")
+    parser = argparse.ArgumentParser(description="Extract, translate, and summarize PDF papers locally.")
     sub = parser.add_subparsers(dest="command", required=True)
-    run = sub.add_parser("run", help="PDF를 Markdown·HTML 논문 패키지로 변환")
+    run = sub.add_parser("run", help="Extract, translate, and summarize a PDF into Markdown, HTML, and ZIP")
     run.add_argument("pdf", type=Path)
     run.add_argument("-o", "--output", type=Path)
     run.add_argument("--translation-model", default=TRANSLATION_MODEL)
@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--target-language", default="English")
     run.add_argument("--chunk-size", type=int, default=1800)
     run.add_argument("--ollama-url", default=OLLAMA_URL)
-    extract = sub.add_parser("extract", help="PDF 추출 결과 확인 (선택적 로컬 고품질 OCR)")
+    extract = sub.add_parser("extract", help="Extract original Markdown, HTML, and ZIP with optional local document OCR")
     extract.add_argument("pdf", type=Path)
     extract.add_argument("-o", "--output", type=Path)
     extract.add_argument("--chunk-size", type=int, default=1800)
@@ -79,15 +79,15 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--ocr-mode", choices=("auto","off","force"), default="auto")
         command.add_argument("--ocr-dpi", type=int, default=216)
         command.add_argument("--ocr-min-confidence", type=float, default=.85)
-        command.add_argument("--vision-ocr-model", default="", help="선택적 고품질 로컬 OCR 모델 (예: glm-ocr:latest)")
-        command.add_argument("--vision-ocr-url", default=OLLAMA_URL, help="OCR용 로컬 Ollama URL")
-        command.add_argument("--vision-ocr-digest", default="", help="재현할 OCR 모델의 SHA-256 digest 확인")
-    check = sub.add_parser("doctor", help="설치 및 모델 상태 점검")
+        command.add_argument("--vision-ocr-model", default="", help="Optional local document OCR model (e.g. glm-ocr:latest)")
+        command.add_argument("--vision-ocr-url", default=OLLAMA_URL, help="Local Ollama URL for document OCR")
+        command.add_argument("--vision-ocr-digest", default="", help="Verify the OCR model SHA-256 digest for reproducibility")
+    check = sub.add_parser("doctor", help="Check dependencies and model availability")
     check.add_argument("--translation-model", default=TRANSLATION_MODEL)
     check.add_argument("--summary-model", default=SUMMARY_MODEL)
     check.add_argument("--ollama-url", default=OLLAMA_URL)
-    check.add_argument("--ocr", action="store_true", help="로컬 OCR 모델과 체크섬 확인")
-    check.add_argument("--skip-ollama", action="store_true", help="Ollama 없이 추출 설치 상태만 확인")
+    check.add_argument("--ocr", action="store_true", help="Verify local OCR models and checksums")
+    check.add_argument("--skip-ollama", action="store_true", help="Check extraction dependencies without Ollama")
     check.add_argument("--vision-ocr-model", default="")
     args = parser.parse_args(argv)
     try:
@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "extract":
             output = args.output or Path("outputs") / f"{args.pdf.stem}.extracted.md"
             path = extract_pdf(args.pdf, output, chunk_size=args.chunk_size,ocr=ocr)
-            print(f"추출 완료: {path.resolve()}\nHTML: {path.with_suffix('.html').resolve()}\nZIP: {path.with_suffix('.zip').resolve()}")
+            print(f"Extraction complete: {path.resolve()}\nHTML: {path.with_suffix('.html').resolve()}\nZIP: {path.with_suffix('.zip').resolve()}")
             return 0
         output = args.output or Path("outputs") / f"{args.pdf.stem}.translated.md"
         path = process_pdf(
@@ -109,10 +109,10 @@ def main(argv: list[str] | None = None) -> int:
             ocr=ocr,
             progress=lambda stage, index, total: print(f"{stage}: {index}/{total}", flush=True),
         )
-        print(f"완료: {path.resolve()}\nHTML: {path.with_suffix('.html').resolve()}\nZIP: {path.with_suffix('.zip').resolve()}")
+        print(f"Complete: {path.resolve()}\nHTML: {path.with_suffix('.html').resolve()}\nZIP: {path.with_suffix('.zip').resolve()}")
         return 0
     except (ProcessingError, ValueError) as exc:
-        print(f"오류: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         return 1
 
 

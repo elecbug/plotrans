@@ -41,7 +41,7 @@ def image_reference(match: re.Match) -> ImageReference:
     attrs = parser.attributes
     source = attrs.get("src", "")
     if not re.fullmatch(r"figs/[A-Za-z0-9_./-]+", source):
-        raise ValueError("지원하지 않는 인라인 이미지 경로입니다.")
+        raise ValueError("Unsupported inline image path.")
     style = attrs.get("style", "") or ""
     height = re.search(r"(?:^|;)\s*height\s*:\s*([0-9.]+)em", style)
     align = re.search(r"(?:^|;)\s*vertical-align\s*:\s*([-+0-9.]+)em", style)
@@ -51,13 +51,13 @@ def image_reference(match: re.Match) -> ImageReference:
                               float(height.group(1)) if height else 1.0,
                               float(align.group(1)) if align else -0.15, aspect)
     except (TypeError, ValueError) as exc:
-        raise ValueError("인라인 이미지의 크기 속성이 올바르지 않습니다.") from exc
+        raise ValueError("Invalid inline image size attributes.") from exc
 
 
 def inline_image_tag(source: str, alt: str, height_em: float, align_em: float, aspect_ratio: float) -> str:
     values = (height_em, align_em, aspect_ratio)
     if not all(math.isfinite(v) for v in values) or height_em <= 0 or aspect_ratio <= 0:
-        raise ValueError("인라인 이미지 크기는 유효한 양수여야 합니다.")
+        raise ValueError("Inline image dimensions must be finite positive values.")
     height_em = min(max(height_em, 0.2), 20)
     align_em = min(max(align_em, -20), 20)
     height_px = max(1, round(height_em * 16))
