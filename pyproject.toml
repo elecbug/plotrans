@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paper-localizer"
+version = "0.1.0"
+description = "Local PDF paper extraction, summary, and aligned translation"
+requires-python = ">=3.11"
+dependencies = ["opendataloader-pdf==2.5.17"]
+
+[project.optional-dependencies]
+ui = ["streamlit==1.66.1"]
+
+[project.scripts]
+paper-localizer = "paper_localizer.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

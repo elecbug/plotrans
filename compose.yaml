@@ -1,0 +1,21 @@
+services:
+  ollama:
+    image: ollama/ollama:0.40.14
+    volumes:
+      - ollama_models:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+
+  app:
+    build: .
+    environment:
+      OLLAMA_HOST_URL: http://ollama:11434
+    volumes:
+      - ./outputs:/app/outputs
+    ports:
+      - "127.0.0.1:8501:8501"
+    depends_on:
+      - ollama
+
+volumes:
+  ollama_models:
