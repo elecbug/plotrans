@@ -50,6 +50,8 @@ class Article:
     summary: str = ""
     translated: bool = False
     title_markup: str = ""
+    warnings: list[str] = field(default_factory=list)
+    ocr_sources: list[dict] = field(default_factory=list)
 
 
 def _plain(text: str) -> str:
@@ -71,10 +73,19 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
         raise ValueError("원문과 번역 청크 수가 일치하지 않습니다.")
     article = Article(title, filename, document.get("number of pages", "?"), language,
                       str(document.get("author") or ""), summary=summary, translated=translations is not None)
+    if pages := document.get("source image pages"):
+        article.warnings.append("Pages " + ", ".join(map(str, pages)) +
+                                " use an undecodable font. Complete source pages are preserved as images; OCR is required to translate their text.")
+    article.ocr_sources = document.get("ocr sources", [])
+    if pages := document.get("ocr pages"):
+        article.warnings.append("Local CPU OCR was used on pages " + ", ".join(map(str,pages)) +
+            ". OCR can misread text. Original pages are available below; uncertain text and notation are preserved as source images.")
+    if pages := document.get("ocr failures"):
+        article.warnings.append("OCR found no readable text on pages " + ", ".join(map(str,pages)) + ". Check the original pages.")
     current: Section | None = None
     abstract_mode = False
     pending_figure: Unit | None = None
-    used = {"abstract", "summary", "full-text", "figures"}
+    used = {"abstract", "summary", "full-text", "figures", "ocr-sources"}
     figure_count = 0
 
     def append(unit: Unit) -> None:
@@ -84,7 +95,20 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
 
     for index, chunk in enumerate(chunks):
         translated = translations[index] if translations is not None else ""
+        if chunk.kind in {"caption", "caption-image"}:
+            # A source-only caption crop has no machine translation. Showing
+            # it in both columns would duplicate the image under a false label.
+            unit = Unit(chunk.source, translated if chunk.kind == "caption" else "", kind=chunk.kind, pages=chunk.pages)
+            if pending_figure and chunk.caption_target:
+                pending_figure.caption = unit
+            else:
+                append(unit)
+            pending_figure = None
+            continue
         if chunk.kind in {"figure", "formula"}:
+            if document.get("source image pages") and current is None:
+                current = Section("Source pages", "source-pages")
+                article.sections.append(current); abstract_mode = False
             unit = Unit(chunk.source, kind=chunk.kind, pages=chunk.pages)
             if chunk.kind == "figure":
                 figure_count += 1; unit.anchor = f"figure-{figure_count}"
@@ -166,6 +190,8 @@ def article_markdown(article: Article) -> str:
     lines = [f"# {article.title_markup or article.title}", ""]
     if article.author: lines.extend([article.author, ""])
     lines.extend([f"- Source file: `{article.filename}`", f"- Pages: {article.pages}", ""])
+    for warning in article.warnings:
+        lines.extend(["> Parsing note: " + warning, ""])
     if article.front:
         lines.extend(["<details>", "<summary>Authors and source information</summary>", ""])
         lines.extend(_unit_markdown(unit) + "\n" for unit in article.front)
@@ -181,6 +207,11 @@ def article_markdown(article: Article) -> str:
     for section in article.sections:
         lines.extend([f"{'#' * section.level} {section.title}", ""])
         lines.extend(_unit_markdown(unit) + "\n" for unit in section.units)
+    if article.ocr_sources:
+        lines.extend(["<details>", "<summary>Original pages used for OCR</summary>", ""])
+        for source in article.ocr_sources:
+            lines.extend([f"![Original source page {source['page']}]({source['source']})", ""])
+        lines.extend(["</details>", ""])
     lines.extend(["---", "", "Extracted from the source PDF. Equation images preserve the original notation.", ""])
     return "\n".join(lines)
 
@@ -212,6 +243,7 @@ def _pair_html(unit: Unit, caption: bool = False) -> str:
 
 def article_html(article: Article, markdown_name: str) -> str:
     navigation = []
+    if article.ocr_sources: navigation.append('<a href="#ocr-sources">OCR source pages</a>')
     if article.abstract: navigation.append('<a href="#abstract">Abstract</a>')
     if article.summary: navigation.append('<a href="#summary">Article summary</a>')
     navigation.extend(f'<a class="depth-{section.level}" href="#{section.anchor}">{escape(_plain(section.title))}</a>'
@@ -228,8 +260,15 @@ def article_html(article: Article, markdown_name: str) -> str:
     summary = ('<section class="summary-card" id="summary"><h2>Article summary</h2>' + _md_html(article.summary) + '</section>') if article.summary else ""
     front = ('<details class="author-details"><summary>Authors and source information</summary>' +
              "".join(_unit_html(unit) for unit in article.front) + '</details>') if article.front else ""
+    front = "".join('<aside class="parsing-note">' + escape(warning) + '</aside>' for warning in article.warnings) + front
     body = "".join(f'<section class="paper-section" id="{section.anchor}"><h{section.level}>{_md_html(section.title, True)}</h{section.level}>'
                    + "".join(_unit_html(unit) for unit in section.units) + '</section>' for section in article.sections)
+    if article.ocr_sources:
+        body += '<details class="ocr-sources" id="ocr-sources"><summary>Original pages used for OCR</summary>'
+        for source in article.ocr_sources:
+            body += (f'<figure><a href="{escape(source["source"])}"><img src="{escape(source["source"])}" '
+                     f'alt="Original source page {source["page"]}" loading="lazy"></a><figcaption>Source page {source["page"]}</figcaption></figure>')
+        body += '</details>'
     checked_source = "" if article.translated else "checked"
     checked_both = "checked" if article.translated else ""
     controls = ('<label for="view-source">Original</label><label for="view-translated">Translation</label>'

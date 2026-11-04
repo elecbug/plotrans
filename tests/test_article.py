@@ -6,7 +6,7 @@ from zipfile import ZipFile
 
 from PIL import Image
 
-from paper_localizer.article import write_article
+from paper_localizer.article import article_html, build_article, write_article
 from paper_localizer.bundle import FIGURE_LINK, standalone_html
 from paper_localizer.core import Chunk
 from paper_localizer.markup import image_reference, inline_image_tag
@@ -24,6 +24,15 @@ class Audit(HTMLParser):
 
 
 class ArticleTests(unittest.TestCase):
+    def test_source_only_caption_image_is_not_duplicated_as_a_translation(self):
+        image="![Original caption](figs/paper/caption.png)"
+        chunks=[Chunk(1,(1,),"![Plot](figs/paper/plot.png)","figure"),
+                Chunk(2,(1,),image,"caption-image","figs/paper/plot.png")]
+        article=build_article({},"Paper","paper.pdf",chunks,[chunks[0].source,image])
+        html=article_html(article,"paper.md")
+        self.assertEqual(html.count('src="figs/paper/caption.png"'),1)
+        self.assertFalse(article.front[0].caption.translation)
+
     def test_article_exports_structure_inline_equations_and_all_portable_assets(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory); assets = root / "figs/paper"; assets.mkdir(parents=True)

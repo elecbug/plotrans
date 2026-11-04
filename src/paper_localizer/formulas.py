@@ -15,7 +15,7 @@ import unicodedata
 import pypdfium2 as pdfium
 
 from .figures import _PDFIUM_LOCK, _area, _intersection, _nodes, _union
-from .markup import inline_image_tag
+from .markup import FIGURE_LINK, image_reference, inline_image_tag
 
 
 _MATH_FONT = re.compile(r"(?:CMMI|CMSY|CMEX|MSAM|MSBM|Symbol|Math)", re.I)
@@ -124,6 +124,13 @@ def _expand_expressions(spans: list[TextSpan]) -> list[TextSpan]:
     for index, span in enumerate(spans):
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", span.text) or span.text.lower() in prose: continue
         neighbors = spans[max(0, index - 1):index] + spans[index + 1:index + 2]
+        # Named subscripts such as D_lazy are ordinary roman text in many TeX
+        # PDFs. Their smaller font and lowered baseline establish membership.
+        if any(other.math and span.font_size <= other.font_size * .88
+               and 0 < other.baseline - span.baseline < max(12, other.font_size)
+               and max(span.box[0]-other.box[2], other.box[0]-span.box[2], 0) < 3
+               for other in neighbors):
+            identifiers.add(span.index)
         if any(other.text in {"=", "≤", "≥", "+", "*", "/"} for other in neighbors): identifiers.add(span.index)
         if index + 1 < len(spans) and spans[index + 1].text == "(":
             gap = spans[index + 1].box[0] - span.box[2]
@@ -133,7 +140,8 @@ def _expand_expressions(spans: list[TextSpan]) -> list[TextSpan]:
         return (span.math or span.index in identifiers or text in _FUNCTIONS or text.replace(".", "").isdigit()
                 or (len(text) == 1 and text.isalpha())
                 or (text.isalpha() and bool(re.search("Italic|Oblique", span.font_name, re.I)))
-                or all(char in "+-=*/^_()[]{}<>|,:;≤≥≈≠∞·×÷" for char in text))
+                or all(char in "+-=*/^_()[]{}<>|,:;≤≥≈≠∞·×÷∈∉∪∩…" for char in text)
+                or text == "...")
 
     def connected(a: TextSpan, b: TextSpan) -> bool:
         size = max(8, min(max(a.font_size, b.font_size), 24))
@@ -294,6 +302,68 @@ def _split_mixed_heading(node: dict, spans: list[TextSpan]) -> None:
         node["heading split"] = offsets[len(prefix) - 1] + 1
 
 
+def _reconcile_snapshots(nodes: list[dict], spans: list[TextSpan], assets: list[dict]) -> int:
+    """The largest source snapshot owns every text fragment visible inside it.
+
+    A piecewise equation can occupy three overlapping layout nodes. Clearing
+    only the snapshot's originating node leaves the other two on screen.
+    """
+    regions = {a["source"]: tuple(a["bounding box"]) for a in assets if a.get("block")}
+    owners = []
+    for node in nodes:
+        markup = node.get("formula snapshot") or (node.get("content", "") if node.get("formula image") else "")
+        match = next(FIGURE_LINK.finditer(markup), None)
+        if match and (source := image_reference(match).source) in regions:
+            owners.append((node, regions[source]))
+    owners.sort(key=lambda item: _area(item[1]), reverse=True)
+    suppressed = set(); changed = 0
+    for owner, region in owners:
+        if id(owner) in suppressed:
+            continue
+        for node in nodes:
+            if node is owner or id(node) in suppressed or not (box := _box(node)):
+                continue
+            if not node.get("content") and not node.get("formula snapshot"):
+                continue
+            if node.get("formula snapshot") or node.get("formula image"):
+                markup = node.get("formula snapshot") or node.get("content", "")
+                match = next(FIGURE_LINK.finditer(markup), None)
+                if match:
+                    box = regions.get(image_reference(match).source, box)
+            if _intersection(box, region) / max(_area(box), 1) >= .98:
+                node["content"] = ""
+                node.pop("formula snapshot", None)
+                node["suppressed"] = True
+                suppressed.add(id(node)); changed += 1
+        # Partial paragraph overlap is removed by ordinary-text anchors rather
+        # than dropping prose outside the snapshot's visible bounds.
+        partial = [n for n in nodes if n is not owner and id(n) not in suppressed
+                   and not n.get("formula snapshot") and not FIGURE_LINK.search(n.get("content", ""))]
+        changed += _remove_figure_duplicates(partial, spans, [region], preserve_captions=False)
+    return changed
+
+
+def _complete_region(box: Box, nodes: list[dict]) -> Box:
+    """Finish overlapping native blocks before suppressing their duplicate text.
+
+    Do not erase a paragraph just because 85% is in a crop. Expand that crop to
+    retain its edge too, with a bounded area increase to avoid region chaining.
+    """
+    initial_area = _area(box)
+    while True:
+        previous = box
+        for node in nodes:
+            other = _box(node)
+            if not other or not node.get("content") or not _area(other):
+                continue
+            combined = _union(box, other)
+            if (_intersection(other, box) / _area(other) >= .8
+                    and _area(combined) <= initial_area * 1.5):
+                box = combined
+        if box == previous:
+            return box
+
+
 def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
     """Insert faithful inline PNG equations, keeping ordinary text editable."""
     with pdf_path.open("rb") as file:
@@ -304,14 +374,39 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
         if isinstance(node.get("content"), str) and _box(node):
             by_page[node.get("page number", 1)].append(node)
     figures = document.get("figures", [])
-    formulas: list[dict] = []
+    formulas: list[dict] = list(document.get("ocr formula assets", []))
 
     with _PDFIUM_LOCK, pdfium.PdfDocument(pdf_path) as pdf:
         for page_number in range(1, len(pdf) + 1):
             page = pdf[page_number - 1]
             try:
+                # OCR already preserved uncertain/math lines as complete crops.
+                # Reusing undecodable native glyphs would overwrite its prose.
+                if page_number in document.get("ocr pages", []):
+                    continue
                 width, height = page.get_size()
                 spans = _spans(page)
+                undecoded = sum(not s.font_name for s in spans)
+                if spans and undecoded / len(spans) > .75:
+                    # Some old PDFs encode *all prose* as custom Type3 glyphs.
+                    # Preserve one complete page instead of thousands of tiny
+                    # pseudo-equations with unusable OCR-free translations.
+                    asset_dir.mkdir(parents=True, exist_ok=True)
+                    destination = asset_dir / f"page-{page_number:03d}-source.png"
+                    bitmap = page.render(scale=1.5, draw_annots=False)
+                    image = bitmap.to_pil(); image.save(destination); image.close(); bitmap.close()
+                    for node in _nodes(document):
+                        if node.get("page number") == page_number:
+                            node["suppressed"] = True
+                    document["figures"] = [f for f in document.get("figures", []) if f["page number"] != page_number]
+                    reference = destination.relative_to(output_dir).as_posix()
+                    snapshot = {"type": "formula", "page number": page_number, "bounding box": [0, 0, width, height],
+                                "formula image": True,
+                                "content": f"![Source page {page_number} — undecodable font]({reference})"}
+                    at = next((i for i,n in enumerate(document.get("kids", [])) if n.get("page number",1) > page_number), len(document.get("kids", [])))
+                    document.setdefault("kids", []).insert(at, snapshot)
+                    document.setdefault("source image pages", []).append(page_number)
+                    continue
                 figure_boxes = [_box(f) for f in figures if f["page number"] == page_number]
                 nodes = by_page.get(page_number, [])
                 document["deduplicated figure text"] = document.get("deduplicated figure text", 0) + _remove_figure_duplicates(
@@ -345,6 +440,8 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 def save(box: Box, *, block: bool = False, metrics: tuple[float, float] | None = None) -> str:
                     nonlocal counter
                     counter += 1
+                    if block:
+                        box = _complete_region(box, nodes)
                     left, bottom, right, top = box
                     left, bottom = max(0, left - 0.4), max(0, bottom - 1.0)
                     right, top = min(width, right + 0.4), min(height, top + 1.0)
@@ -411,8 +508,22 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                             break
                     document.setdefault("kids", []).insert(insertion, equation)
                 for node in nodes:
+                    if not node.get("formula snapshot") and re.search(r"[\ue000-\uf8ff\ufffd]", node.get("content", "")):
+                        # Preserve undecoded source text instead of exposing a
+                        # replacement character after otherwise successful math
+                        # alignment (e.g. a symbol in a reference or footnote).
+                        if box := _box(node):
+                            if _area(box):
+                                node["formula snapshot"] = save(box, block=True)
+                for node in nodes:
                     _split_mixed_heading(node, spans)
+                page_nodes = [n for n in _nodes(document) if n.get("page number") == page_number]
+                document["deduplicated equation text"] = document.get("deduplicated equation text", 0) + _reconcile_snapshots(
+                    page_nodes, spans, [a for a in formulas if a["page number"] == page_number])
             finally:
                 page.close()
-    document["formulas"] = formulas
+    active = {image_reference(m).source for node in _nodes(document) if not node.get("suppressed")
+              for text in (node.get("content", ""), node.get("formula snapshot", ""))
+              for m in FIGURE_LINK.finditer(text)}
+    document["formulas"] = [asset for asset in formulas if asset["source"] in active]
     return document

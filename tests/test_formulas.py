@@ -8,7 +8,7 @@ from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
 
 from paper_localizer.bundle import FIGURE_LINK, build_bundle, inline_equation_preview
 from paper_localizer.core import ProcessingError, _split_text, _translate_chunk, extract_blocks
-from paper_localizer.formulas import TextSpan, _remove_figure_duplicates, recover_formulas
+from paper_localizer.formulas import TextSpan, _expand_expressions, _groups, _remove_figure_duplicates, recover_formulas
 from paper_localizer.markup import image_reference, inline_image_tag
 from io import BytesIO
 from zipfile import ZipFile
@@ -63,6 +63,31 @@ def math_fixture(path: Path) -> dict:
 
 
 class FormulaTests(unittest.TestCase):
+    def test_named_subscript_stays_with_its_math_identifier(self):
+        spans = [TextSpan(0, "D", (30, 60, 39, 71), True, 10, 60, "MathMI"),
+                 TextSpan(1, "lazy", (39, 57, 54, 63), False, 7, 57, "Roman"),
+                 TextSpan(2, "values", (60, 60, 95, 71), False, 10, 60, "Roman")]
+        groups = _groups(_expand_expressions(spans))
+        self.assertEqual([[s.text for s in g] for g in groups], [["D", "lazy"]])
+
+    def test_whole_page_of_undecodable_fonts_has_one_complete_source_image(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory); source = root/"legacy.pdf"
+            document = math_fixture(source)
+            writer = PdfWriter(clone_from=source)
+            stream = DecodedStreamObject()
+            stream.set_data(b"BT /M0 16 Tf 40 180 Td <010201020102> Tj ET")
+            writer.pages[0][NameObject("/Contents")] = writer._add_object(stream)
+            with source.open("wb") as file: writer.write(file)
+            writer.close()
+            document = recover_formulas(source, document, root)
+            self.assertEqual(document["source image pages"], [1])
+            self.assertEqual(document["formulas"], [])
+            blocks = extract_blocks(document)
+            self.assertEqual(len(blocks), 1)
+            self.assertIn("Source page 1", blocks[0].text)
+            self.assertTrue((root / image_reference(next(FIGURE_LINK.finditer(blocks[0].text))).source).is_file())
+
     def test_embedded_figure_labels_are_removed_without_removing_neighboring_prose(self):
         spans = [TextSpan(0, "Before prose.", (0, 60, 40, 70), False, 10, 60),
                  TextSpan(1, "Input", (10, 30, 30, 40), False, 10, 30),

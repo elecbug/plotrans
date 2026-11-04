@@ -11,7 +11,8 @@ from pypdf.generic import (DecodedStreamObject, DictionaryObject,
 
 from paper_localizer.bundle import build_bundle, figure_path
 from paper_localizer.core import extract_blocks, make_chunks, process_pdf
-from paper_localizer.figures import attach_figures
+from paper_localizer.figures import _text_labels, attach_figures
+import pypdfium2 as pdfium
 
 
 def make_fixture(path: Path) -> dict:
@@ -71,6 +72,31 @@ def make_fixture(path: Path) -> dict:
 
 
 class FigureTests(unittest.TestCase):
+    def test_form_xobject_legend_uses_transformed_page_coordinates(self):
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            root = Path(directory); source = root/"transformed.pdf"
+            writer = PdfWriter(); page = writer.add_blank_page(width=600, height=500)
+            font = DictionaryObject({NameObject("/Type"): NameObject("/Font"), NameObject("/Subtype"): NameObject("/Type1"),
+                                     NameObject("/BaseFont"): NameObject("/Helvetica")})
+            resources = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"):font})})
+            form = DecodedStreamObject(); form.set_data(b"0 20 100 50 re S BT /F1 8 Tf 105 25 Td (Transformed legend) Tj ET")
+            from pypdf.generic import ArrayObject
+            form.update({NameObject("/Type"):NameObject("/XObject"), NameObject("/Subtype"):NameObject("/Form"),
+                         NameObject("/BBox"):ArrayObject([NumberObject(n) for n in [0,0,250,100]]), NameObject("/Resources"):resources})
+            page[NameObject("/Resources")] = DictionaryObject({NameObject("/XObject"):DictionaryObject({NameObject("/Plot"):writer._add_object(form)})})
+            stream = DecodedStreamObject(); stream.set_data(b"q 1.5 0 0 1.5 150 200 cm /Plot Do Q")
+            page[NameObject("/Contents")] = writer._add_object(stream)
+            with source.open("wb") as file: writer.write(file)
+            writer.close()
+            with pdfium.PdfDocument(source) as pdf:
+                labels = _text_labels(pdf[0])
+            legend = next(n for n in labels if "Transformed" in n["content"])
+            self.assertGreater(legend["bounding box"][0], 300)
+            self.assertGreater(legend["bounding box"][1], 230)
+            document = attach_figures(source, {"kids":[]}, root)
+            self.assertEqual(len(document["figures"]), 1)
+            self.assertGreater(document["figures"][0]["bounding box"][2], legend["bounding box"][2])
+
     def test_vector_and_raster_crops_remove_labels_but_preserve_body_and_table(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory)

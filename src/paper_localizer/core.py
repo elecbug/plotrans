@@ -18,6 +18,8 @@ from .figures import attach_figures
 from .formulas import recover_formulas
 from .bundle import FIGURE_LINK
 from .article import build_article, article_markdown, write_article
+from .layout import bind_captions, prepare_layout
+from .ocr import OcrOptions, apply_ocr, preserve_ocr_regions
 
 
 TRANSLATION_MODEL = "kaelri/hy-mt2:7b-q4_K_M"
@@ -34,6 +36,7 @@ class Block:
     page: int
     kind: str
     text: str
+    caption_target: str = ""
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,7 @@ class Chunk:
     pages: tuple[int, ...]
     source: str
     kind: str = "text"
+    caption_target: str = ""
 
 
 def _descendant_text(node: dict) -> str:
@@ -81,26 +85,31 @@ def extract_blocks(document: dict) -> list[Block]:
         kind = str(node.get("type", "")).lower()
         page = node.get("page number", inherited_page)
         page = page if isinstance(page, int) and page > 0 else inherited_page
-        if kind in {"header", "footer"}:
+        if kind in {"header", "footer"} or node.get("suppressed"):
+            return
+        if node.get("attached caption"):
             return
         if kind in {"image", "picture"}:
             source = node.get("source")
             if isinstance(source, str) and source.startswith("figs/"):
                 alt = str(node.get("alt", f"Fig. p.{page}")).replace("[", "").replace("]", "")
                 blocks.append(Block(page, "image", f"![{alt}]({source})"))
+                if caption := node.get("caption node"):
+                    value = caption.get("formula snapshot") or caption.get("content", "")
+                    if value:
+                        blocks.append(Block(page, "caption-image" if caption.get("formula snapshot") else "caption", value, source))
             return
         if kind == "table":
             table = _table_markdown(node)
             if table:
                 blocks.append(Block(page, kind, table))
             return
+        if snapshot := node.get("formula snapshot"):
+            blocks.append(Block(page, "caption-image" if kind == "caption" else "formula", snapshot))
+            return
         content = node.get("content")
         if isinstance(content, str) and content.strip():
             text = content.strip()
-            if snapshot := node.get("formula snapshot"):
-                # An uncertain source block is displayed once as a complete image.
-                blocks.append(Block(page, "formula", snapshot))
-                return
             if node.get("formula image"):
                 blocks.append(Block(page, "formula", text))
                 return
@@ -163,10 +172,10 @@ def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
     for block in blocks:
         if block.kind == "heading" or re.match(r"^(?:Abstract|초록)\s*[.:：]", block.text, re.I):
             flush()
-        if block.kind in {"image", "formula"}:
+        if block.kind in {"image", "formula", "caption", "caption-image"}:
             flush()
-            kind = "figure" if block.kind == "image" else "formula"
-            chunks.append(Chunk(len(chunks) + 1, (block.page,), block.text, kind))
+            kind = "figure" if block.kind == "image" else block.kind
+            chunks.append(Chunk(len(chunks) + 1, (block.page,), block.text, kind, block.caption_target))
             continue
         for part in _split_text(block.text, limit):
             part_size = len(FIGURE_LINK.sub("[[MATH_0001]]", part))
@@ -223,7 +232,16 @@ class OllamaClient:
         return answer
 
 
-def parse_pdf(pdf_path: Path, output_dir: Path | None = None) -> dict:
+def prepare_document(pdf_path: Path, document: dict, output_dir: Path, *, ocr: OcrOptions | None = None) -> dict:
+    document = apply_ocr(pdf_path, document, output_dir, ocr)
+    document = prepare_layout(document)
+    document = preserve_ocr_regions(pdf_path, document, output_dir)
+    document = attach_figures(pdf_path, document, output_dir)
+    document = recover_formulas(pdf_path, document, output_dir)
+    return bind_captions(document)
+
+
+def parse_pdf(pdf_path: Path, output_dir: Path | None = None, *, ocr: OcrOptions | None = None) -> dict:
     try:
         import opendataloader_pdf
     except ImportError as exc:
@@ -248,10 +266,9 @@ def parse_pdf(pdf_path: Path, output_dir: Path | None = None) -> dict:
             document = json.load(file)
         try:
             destination = output_dir or Path("outputs")
-            document = attach_figures(pdf_path, document, destination)
-            return recover_formulas(pdf_path, document, destination)
+            return prepare_document(pdf_path, document, destination, ocr=ocr)
         except Exception as exc:
-            raise ProcessingError(f"그림·수식 영역 보존 실패: {exc}") from exc
+            raise ProcessingError(f"PDF/OCR·그림·수식 처리 실패: {exc}") from exc
 
 
 def _translation_prompt(source: str, target_language: str) -> str:
@@ -339,14 +356,14 @@ def render_markdown(document: dict, pdf_name: str, chunks: list[Chunk],
     return article_markdown(article)
 
 
-def extract_pdf(pdf_path: Path, output_path: Path, *, chunk_size: int = 1800) -> Path:
+def extract_pdf(pdf_path: Path, output_path: Path, *, chunk_size: int = 1800, ocr: OcrOptions | None = None) -> Path:
     """Write a source-only preview without requiring Ollama."""
     pdf_path, output_path = Path(pdf_path), Path(output_path)
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
         raise ProcessingError("존재하는 PDF 파일을 지정하세요.")
     if output_path.suffix.lower() != ".md":
         raise ProcessingError("출력 파일 확장자는 .md여야 합니다.")
-    document = parse_pdf(pdf_path, output_path.parent)
+    document = parse_pdf(pdf_path, output_path.parent, ocr=ocr)
     chunks = make_chunks(extract_blocks(document), chunk_size)
     if not chunks:
         raise ProcessingError("추출한 본문 텍스트가 없습니다. 스캔 PDF라면 OCR 처리가 필요합니다.")
@@ -362,7 +379,8 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
                 ollama_url: str = OLLAMA_URL,
                 progress: Callable[[str, int, int], None] | None = None,
                 parser: Callable[[Path], dict] | None = None,
-                client: OllamaClient | None = None) -> Path:
+                client: OllamaClient | None = None,
+                ocr: OcrOptions | None = None) -> Path:
     pdf_path = Path(pdf_path)
     output_path = Path(output_path)
     if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
@@ -379,7 +397,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
     client.check_models(translation_model, summary_model)
     if progress:
         progress("PDF 분석", 0, 1)
-    document = parser(pdf_path) if parser else parse_pdf(pdf_path, output_path.parent)
+    document = parser(pdf_path) if parser else parse_pdf(pdf_path, output_path.parent, ocr=ocr)
     blocks = extract_blocks(document)
     if not blocks:
         raise ProcessingError("추출한 본문 텍스트가 없습니다. 스캔 PDF라면 OCR 처리가 필요합니다.")
@@ -413,7 +431,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
             continue
         if progress:
             progress("번역 및 요약", index, len(chunks))
-        if chunk.kind in {"figure", "formula"}:
+        if chunk.kind in {"figure", "formula", "caption-image"}:
             translations.append(chunk.source)
             notes.append("NONE")
         else:

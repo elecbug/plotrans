@@ -18,6 +18,12 @@ dependencies = [
 
 [project.optional-dependencies]
 ui = ["streamlit==1.66.1"]
+ocr = [
+    "rapidocr==3.10.0",
+    "onnxruntime==1.23.2",
+    "opencv-python-headless==4.12.0.88",
+    "numpy==2.2.6",
+]
 
 [project.scripts]
 paper-localizer = "paper_localizer.cli:main"
@@ -26,4 +32,4 @@ paper-localizer = "paper_localizer.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-paper_localizer = ["assets/*.css"]
+paper_localizer = ["assets/*.css", "assets/*.json"]

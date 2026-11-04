@@ -10,6 +10,7 @@ import streamlit as st
 from paper_localizer.core import (OLLAMA_URL, SUMMARY_MODEL, TRANSLATION_MODEL,
                                   ProcessingError, process_pdf)
 from paper_localizer.bundle import standalone_html
+from paper_localizer.ocr import OcrOptions
 
 
 def main() -> None:
@@ -23,6 +24,9 @@ def main() -> None:
         target_language = st.text_input("번역 언어", "English")
         ollama_url = st.text_input("Ollama 주소", OLLAMA_URL)
         chunk_size = st.slider("청크 크기 (문자)", 500, 3500, 1800, 100)
+        ocr_mode = st.selectbox("OCR 처리", ["auto","off","force"],
+                                help="auto: 해독 불가·스캔 페이지 자동 처리, off: 사용 안 함, force: 모든 페이지")
+        ocr_dpi = st.slider("OCR 해상도 (DPI)", 96, 400, 216, 8)
     if st.button("분석 및 번역", disabled=uploaded is None, type="primary") and uploaded:
         bar = st.progress(0, text="준비 중")
 
@@ -38,6 +42,7 @@ def main() -> None:
                     source, destination, translation_model=translation_model,
                     summary_model=summary_model, target_language=target_language,
                     chunk_size=chunk_size, ollama_url=ollama_url, progress=update,
+                    ocr=OcrOptions(mode=ocr_mode,dpi=ocr_dpi),
                 )
             except (ProcessingError, ValueError) as exc:
                 st.error(str(exc))

@@ -1,0 +1,11 @@
+.git
+.venv
+.deps
+.deps-ocr
+.tmp
+.scratch
+outputs
+**/__pycache__
+**/*.egg-info
+build
+dist
