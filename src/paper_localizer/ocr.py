@@ -27,6 +27,9 @@ class OcrOptions:
     mode: str = "auto"
     dpi: int = 216
     min_confidence: float = .85
+    vision_model: str = ""
+    vision_url: str = "http://127.0.0.1:11434"
+    vision_digest: str = ""
 
     def __post_init__(self):
         if self.mode not in {"auto", "off", "force"}:
@@ -92,6 +95,12 @@ def _recognize(image) -> list[dict]:
 
 
 def _math_line(text: str) -> bool:
+    if "⊕" in text:
+        return True
+    # Superscripts are often flattened with high OCR confidence. Preserve the
+    # source when a likely exponent or logarithm base has lost its typography.
+    if re.search(r"\b\d+[ijkb](?:[+\-−]\d+)?\b|\b\d+[−-][a-z]\b|\blog\d+[a-z]\b", text):
+        return True
     if re.search(r"https?://|\S+@\S+",text): return False
     return bool(re.search(r"[=<>≤≥∑∫√∈∉≈≠²³⁰¹⁴⁵⁶⁷⁸⁹]|\b(?:log|ln|sin|cos|Pr)\s*\(|\bO\s*\(", text)
                 or (len(text.split()) < 5 and re.search(r"[{}^_]|\d\s*[+*/]\s*\d", text)))
@@ -129,7 +138,7 @@ def _layout(lines: list[dict], page: int, width: float, height: float, options: 
             for j,other in enumerate(lines):
                 if j==i or j in consumed or not re.match(r"[A-Z][a-zA-Z]{3}",other["text"]):continue
                 a,c,d,e = other["bounding box"]
-                if 0 <= a-r <= typical*.8 and abs((b+t)-(c+e)) < typical*.8:
+                if 0 <= a-r <= typical*2 and abs((b+t)-(c+e)) < typical*.8:
                     line = {"text":line["text"]+" "+other["text"],"score":min(line["score"],other["score"]),
                             "bounding box":list(_union(tuple(line["bounding box"]),tuple(other["bounding box"])))}
                     consumed.add(j);break
@@ -174,6 +183,10 @@ def _layout(lines: list[dict], page: int, width: float, height: float, options: 
                 previous["ocr score"] = min(previous["ocr score"],line["score"])
                 continue
         result.append(node)
+    for node in result:
+        if (page == 1 and node["type"] == "paragraph" and node["bounding box"][1] < height*.3
+                and re.match(r"^(?:[*†]\s*)?This (?:research|work) (?:was|is) (?:partially )?(?:supported|funded)\b", node["content"])):
+            node["type"] = "footnote"
     return result
 
 

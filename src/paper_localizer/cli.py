@@ -14,7 +14,8 @@ from .core import (OLLAMA_URL, SUMMARY_MODEL, TRANSLATION_MODEL,
 from .ocr import OcrError, OcrOptions, model_paths
 
 
-def doctor(url: str, translation_model: str, summary_model: str, *, ocr: bool = False, skip_ollama: bool = False) -> int:
+def doctor(url: str, translation_model: str, summary_model: str, *, ocr: bool = False, skip_ollama: bool = False,
+           vision_model: str = "") -> int:
     failures = 0
     try:
         version = importlib.metadata.version("opendataloader-pdf")
@@ -50,6 +51,12 @@ def doctor(url: str, translation_model: str, summary_model: str, *, ocr: bool = 
         except ProcessingError as exc:
             print(f"[오류] {exc}")
             failures += 1
+    if vision_model:
+        try:
+            OllamaClient(url, timeout=10).check_models(vision_model)
+            print(f"[OK] Local vision OCR model: {vision_model}")
+        except ProcessingError as exc:
+            print(f"[오류] {exc}"); failures += 1
     return 1 if failures else 0
 
 
@@ -64,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--target-language", default="English")
     run.add_argument("--chunk-size", type=int, default=1800)
     run.add_argument("--ollama-url", default=OLLAMA_URL)
-    extract = sub.add_parser("extract", help="Ollama 없이 PDF 추출 결과만 확인")
+    extract = sub.add_parser("extract", help="PDF 추출 결과 확인 (선택적 로컬 고품질 OCR)")
     extract.add_argument("pdf", type=Path)
     extract.add_argument("-o", "--output", type=Path)
     extract.add_argument("--chunk-size", type=int, default=1800)
@@ -72,17 +79,23 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--ocr-mode", choices=("auto","off","force"), default="auto")
         command.add_argument("--ocr-dpi", type=int, default=216)
         command.add_argument("--ocr-min-confidence", type=float, default=.85)
+        command.add_argument("--vision-ocr-model", default="", help="선택적 고품질 로컬 OCR 모델 (예: glm-ocr:latest)")
+        command.add_argument("--vision-ocr-url", default=OLLAMA_URL, help="OCR용 로컬 Ollama URL")
+        command.add_argument("--vision-ocr-digest", default="", help="재현할 OCR 모델의 SHA-256 digest 확인")
     check = sub.add_parser("doctor", help="설치 및 모델 상태 점검")
     check.add_argument("--translation-model", default=TRANSLATION_MODEL)
     check.add_argument("--summary-model", default=SUMMARY_MODEL)
     check.add_argument("--ollama-url", default=OLLAMA_URL)
     check.add_argument("--ocr", action="store_true", help="로컬 OCR 모델과 체크섬 확인")
     check.add_argument("--skip-ollama", action="store_true", help="Ollama 없이 추출 설치 상태만 확인")
+    check.add_argument("--vision-ocr-model", default="")
     args = parser.parse_args(argv)
     try:
         if args.command == "doctor":
-            return doctor(args.ollama_url, args.translation_model, args.summary_model,ocr=args.ocr,skip_ollama=args.skip_ollama)
-        ocr = OcrOptions(args.ocr_mode,args.ocr_dpi,args.ocr_min_confidence)
+            return doctor(args.ollama_url, args.translation_model, args.summary_model,ocr=args.ocr,
+                          skip_ollama=args.skip_ollama,vision_model=args.vision_ocr_model)
+        ocr = OcrOptions(args.ocr_mode,args.ocr_dpi,args.ocr_min_confidence,
+                         args.vision_ocr_model, args.vision_ocr_url, args.vision_ocr_digest)
         if args.command == "extract":
             output = args.output or Path("outputs") / f"{args.pdf.stem}.extracted.md"
             path = extract_pdf(args.pdf, output, chunk_size=args.chunk_size,ocr=ocr)

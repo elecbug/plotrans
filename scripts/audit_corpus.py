@@ -118,8 +118,11 @@ def main() -> None:
     parser.add_argument("--only", default="")
     parser.add_argument("--sheets", action="store_true")
     parser.add_argument("--ocr-mode",choices=("auto","off","force"),default="auto")
+    parser.add_argument("--vision-ocr-model", default="")
+    parser.add_argument("--vision-ocr-url", default=core.OLLAMA_URL)
     args = parser.parse_args()
-    pdfs = [p for p in sorted(args.input.glob("*.pdf")) if args.only.lower() in p.name.lower()]
+    filters = args.only.lower().split(",")
+    pdfs = [p for p in sorted(args.input.glob("*.pdf")) if any(part.strip() in p.name.lower() for part in filters)]
     args.output.mkdir(parents=True, exist_ok=True); args.cache.mkdir(parents=True, exist_ok=True)
     missing = [p for p in pdfs if not (args.cache / (p.stem + ".json")).is_file()]
     if missing:
@@ -134,7 +137,8 @@ def main() -> None:
             raw = json.loads((args.cache / (pdf.stem + ".json")).read_text(encoding="utf-8"))
             document = deepcopy(raw)
             if hasattr(core, "prepare_document"):
-                document = core.prepare_document(pdf, document, args.output,ocr=OcrOptions(mode=args.ocr_mode))
+                document = core.prepare_document(pdf, document, args.output,ocr=OcrOptions(
+                    mode=args.ocr_mode, vision_model=args.vision_ocr_model, vision_url=args.vision_ocr_url))
             else:
                 document = recover_formulas(pdf, attach_figures(pdf, document, args.output), args.output)
             output = args.output / (slug(pdf) + ".md")

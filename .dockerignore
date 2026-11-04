@@ -2,6 +2,7 @@
 .venv
 .deps
 .deps-ocr
+.deps-math
 .tmp
 .scratch
 outputs

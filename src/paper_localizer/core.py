@@ -37,6 +37,7 @@ class Block:
     kind: str
     text: str
     caption_target: str = ""
+    source_pages: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,7 @@ def _table_markdown(node: dict) -> str:
 def extract_blocks(document: dict) -> list[Block]:
     """Flatten reading-order JSON while retaining page references and tables."""
     blocks: list[Block] = []
+    footnotes: list[Block] = []
 
     def visit(node: dict, inherited_page: int = 1) -> None:
         kind = str(node.get("type", "")).lower()
@@ -88,6 +90,10 @@ def extract_blocks(document: dict) -> list[Block]:
         if kind in {"header", "footer"} or node.get("suppressed"):
             return
         if node.get("attached caption"):
+            return
+        if kind == "footnote":
+            if content := node.get("content"):
+                footnotes.append(Block(page, "paragraph", content))
             return
         if kind in {"image", "picture"}:
             source = node.get("source")
@@ -132,11 +138,29 @@ def extract_blocks(document: dict) -> list[Block]:
     for element in document.get("kids", []):
         if isinstance(element, dict):
             visit(element)
+    continued: list[Block] = []
+    for block in blocks:
+        previous = continued[-1] if continued else None
+        previous_pages = (previous.source_pages or (previous.page,)) if previous else ()
+        if (previous and previous.kind == block.kind == "paragraph"
+                and block.page == previous_pages[-1] + 1
+                and len(previous.text) > 50 and re.search(r"[A-Za-z,]$", previous.text)
+                and re.match(r"^[a-z]", block.text)
+                and not FIGURE_LINK.search(previous.text + block.text)):
+            continued[-1] = Block(previous.page, "paragraph", previous.text + " " + block.text,
+                                  source_pages=previous_pages + (block.page,))
+        else:
+            continued.append(block)
+    blocks = continued
+    if footnotes:
+        blocks.append(Block(footnotes[0].page, "heading", "## Notes"))
+        blocks.extend(footnotes)
     return blocks
 
 
 def _split_text(text: str, limit: int) -> list[str]:
-    if len(FIGURE_LINK.sub("[[MATH_0001]]", text)) <= limit:
+    from .math_markup import LATEX
+    if len(LATEX.sub("[[MATH_0001]]", FIGURE_LINK.sub("[[MATH_0001]]", text))) <= limit:
         return [text]
     parts: list[str] = []
     remaining = text
@@ -144,7 +168,7 @@ def _split_text(text: str, limit: int) -> list[str]:
         cut = remaining.rfind(" ", 0, limit + 1)
         if cut < limit // 2:
             cut = limit
-        for match in FIGURE_LINK.finditer(remaining):
+        for match in sorted([*FIGURE_LINK.finditer(remaining), *LATEX.finditer(remaining)], key=lambda m:m.start()):
             if match.start() < cut < match.end():
                 cut = match.start() if match.start() else match.end()
                 break
@@ -156,6 +180,7 @@ def _split_text(text: str, limit: int) -> list[str]:
 
 
 def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
+    from .math_markup import LATEX
     if limit < 200:
         raise ValueError("limit must be at least 200 characters")
     chunks: list[Chunk] = []
@@ -172,13 +197,22 @@ def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
     for block in blocks:
         if block.kind == "heading" or re.match(r"^(?:Abstract|초록)\s*[.:：]", block.text, re.I):
             flush()
-        if block.kind in {"image", "formula", "caption", "caption-image"}:
+        if block.kind in {"image", "formula", "caption", "caption-image", "code"}:
             flush()
             kind = "figure" if block.kind == "image" else block.kind
             chunks.append(Chunk(len(chunks) + 1, (block.page,), block.text, kind, block.caption_target))
             continue
+        if len(block.source_pages) > 1:
+            flush()
+            for part in _split_text(block.text, limit):
+                chunks.append(Chunk(len(chunks)+1, block.source_pages, part))
+            continue
         for part in _split_text(block.text, limit):
-            part_size = len(FIGURE_LINK.sub("[[MATH_0001]]", part))
+            part_size = len(LATEX.sub("[[MATH_0001]]", FIGURE_LINK.sub("[[MATH_0001]]", part)))
+            # A paragraph's displayed provenance must not inherit the pages of
+            # unrelated paragraphs that happened to share its model chunk.
+            if pages and block.page not in pages:
+                flush()
             if size + part_size + 2 > limit:
                 flush()
             lines.append(part)
@@ -238,6 +272,10 @@ def prepare_document(pdf_path: Path, document: dict, output_dir: Path, *, ocr: O
     document = preserve_ocr_regions(pdf_path, document, output_dir)
     document = attach_figures(pdf_path, document, output_dir)
     document = recover_formulas(pdf_path, document, output_dir)
+    if ocr and ocr.vision_model:
+        from .vision import refine_document
+        document = refine_document(pdf_path, document, output_dir,
+                                  model=ocr.vision_model, url=ocr.vision_url, expected_digest=ocr.vision_digest)
     return bind_captions(document)
 
 
@@ -281,18 +319,33 @@ def _translation_prompt(source: str, target_language: str) -> str:
     )
 
 
-def _translate_chunk(client: OllamaClient, model: str, source: str, language: str) -> str:
+def _translate_chunk(client: OllamaClient, model: str, source: str, language: str,
+                     equation_text: dict[str, str] | None = None) -> str:
     equations: dict[str, str] = {}
+    context: dict[str, str] = {}
 
     def protect(match: re.Match) -> str:
         token = f"[[MATH_{len(equations) + 1:04d}]]"
         equations[token] = match.group(0)
+        from .markup import image_reference
+        if latex := (equation_text or {}).get(image_reference(match).source):
+            context[token] = latex
         return token
 
     protected = FIGURE_LINK.sub(protect, source)
+    from .math_markup import LATEX
+    def protect_latex(match):
+        token = f"[[MATH_{len(equations) + 1:04d}]]"
+        equations[token] = match.group(0)
+        from .math_markup import expression
+        context[token] = expression(match)
+        return token
+    protected = LATEX.sub(protect_latex, protected)
     prompt = _translation_prompt(protected, language)
     if equations:
         prompt += "\n\nRequired unchanged placeholders: " + ", ".join(equations)
+    if context:
+        prompt += "\n\nLocal OCR equation context (keep placeholders unchanged):\n" + json.dumps(context, ensure_ascii=False)
     for _ in range(2):
         translated = client.chat(model, prompt, translation=True)
         found = re.findall(r"\[\[MATH_\d{4}\]\]", translated)
@@ -305,9 +358,14 @@ def _translate_chunk(client: OllamaClient, model: str, source: str, language: st
     raise ProcessingError("번역 모델이 수식 표식을 누락하거나 중복했습니다. 청크 크기를 줄여 다시 실행하세요.")
 
 
-def _summary_prompt(source: str, pages: tuple[int, ...], language: str) -> str:
+def _summary_prompt(source: str, pages: tuple[int, ...], language: str,
+                    equation_text: dict[str, str] | None = None) -> str:
     page_label = ", ".join(map(str, pages))
-    source = FIGURE_LINK.sub("[equation image]", source)
+    from .markup import image_reference
+    def semantic(match):
+        value = (equation_text or {}).get(image_reference(match).source)
+        return "$" + value + "$" if value else "[unresolved equation image; do not infer its contents]"
+    source = FIGURE_LINK.sub(semantic, source)
     return (
         f"Summarize only the factual claims in this research-paper excerpt in {language}. "
         f"Write up to 3 concise bullet points, each ending with [p.{page_label}]. "
@@ -412,6 +470,8 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
         "chunk_size": chunk_size,
         "sources": [chunk.source for chunk in chunks],
         "kinds": [chunk.kind for chunk in chunks],
+        "math_transcriptions": document.get("math transcriptions", {}),
+        "vision_ocr_identity": {key: value for key, value in document.get("vision ocr", {}).items() if key != "regions"},
     }
     checkpoint = output_path.with_suffix(".progress.json")
     translations: list[str] = []
@@ -431,13 +491,18 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
             continue
         if progress:
             progress("번역 및 요약", index, len(chunks))
-        if chunk.kind in {"figure", "formula", "caption-image"}:
+        if chunk.kind in {"figure", "formula", "caption-image", "code"}:
             translations.append(chunk.source)
-            notes.append("NONE")
+            from .markup import image_reference
+            equations = [document.get("math transcriptions", {}).get(image_reference(match).source)
+                         for match in FIGURE_LINK.finditer(chunk.source)]
+            notes.append("\n".join(f"- Source equation transcribed by local OCR: ${value}$ [p.{', '.join(map(str,chunk.pages))}]"
+                                   for value in equations if value) or "NONE")
         else:
-            translations.append(_translate_chunk(client, translation_model, chunk.source, target_language))
+            translations.append(_translate_chunk(client, translation_model, chunk.source, target_language,
+                                                   document.get("math transcriptions")))
             notes.append(client.chat(
-                summary_model, _summary_prompt(chunk.source, chunk.pages, target_language)
+                summary_model, _summary_prompt(chunk.source, chunk.pages, target_language, document.get("math transcriptions"))
             ))
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_text(json.dumps({"identity": identity, "translations": translations,

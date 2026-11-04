@@ -51,7 +51,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("| Model | Score |", blocks[2].text)
         self.assertNotIn("Footer", " ".join(block.text for block in blocks))
         chunks = make_chunks(blocks, 200)
-        self.assertEqual(chunks[0].pages, (1, 2))
+        self.assertEqual([chunk.pages for chunk in chunks], [(1,), (2,)])
 
     def test_pipeline_writes_grounded_aligned_markdown(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
@@ -64,7 +64,9 @@ class CoreTests(unittest.TestCase):
             self.assertIn("## Article summary", markdown)
             self.assertIn("The method improved accuracy.", markdown)
             self.assertIn("번역된 내용", markdown)
-            self.assertIn("p.1, 2", markdown)
+            self.assertIn("<!-- p.1 -->", markdown)
+            self.assertIn("<!-- p.2 -->", markdown)
+            self.assertNotIn("p.1, 2", markdown)
             self.assertFalse(output.with_suffix(".progress.json").exists())
             self.assertEqual(client.models[0], "kaelri/hy-mt2:7b-q4_K_M")
 

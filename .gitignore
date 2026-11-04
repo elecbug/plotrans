@@ -6,6 +6,7 @@ outputs/
 .tmp/
 .deps/
 .deps-ocr/
+.deps-math/
 *.egg-info/
 build/
 dist/

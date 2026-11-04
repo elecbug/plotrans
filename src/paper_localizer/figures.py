@@ -180,7 +180,9 @@ def _include_labels(region: Box, nodes: list[dict], width: float, height: float)
             continue
         gap_x = max(region[0] - box[2], box[0] - region[2], 0)
         gap_y = max(region[1] - box[3], box[1] - region[3], 0)
-        if (gap_x <= 8 and gap_y <= 13) or (vertical and gap_x <= 35 and gap_y == 0):
+        above_ocr_label = (node.get("font") == "OCR" and box[3] <= region[1]
+                           and len(text.split()) <= 8 and not text.endswith((".", ";", ":")))
+        if (gap_x <= 8 and gap_y <= (28 if above_ocr_label else 13)) or (vertical and gap_x <= 35 and gap_y == 0):
             result = _union(result, box)
     bottom = min(height, result[3] + 4)
     for caption in caption_boxes:
@@ -371,8 +373,17 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                         draw.rectangle((max(0,l-1),max(0,height-t-1),min(width,r+1),min(height,height-b+1)),fill=0)
                 regions = _connected_regions(mask)
                 rules = {r for r in regions if _horizontal_rules(mask, r)}
+                # A diagram's detached ID-space axis can look like a page
+                # separator. Retain it when it sits directly above a captioned
+                # graphic in the same column (e.g. a tree and its scale).
+                diagram_axes = {r for r in rules if any(
+                    other not in rules and other[3] - other[1] > 35
+                    and 0 <= other[1] - r[3] <= 40
+                    and min(r[2], other[2]) - max(r[0], other[0]) > min(r[2]-r[0], other[2]-other[0])*.65
+                    and _has_figure_caption(other, nodes, height)
+                    for other in regions)}
                 mask.close(); image.close(); bitmap.close()
-                regions = [r for r in regions if r not in rules or any(
+                regions = [r for r in regions if r not in rules or r in diagram_axes or any(
                     (n.get("type") in {"image", "picture", "table"}
                      and (b := _node_box(n, height)) and _intersection(r,b)/max(_area(r),1) > .5)
                     or (n.get("type") == "caption" and (b := _node_box(n,height))

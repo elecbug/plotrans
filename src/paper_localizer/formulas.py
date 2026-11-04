@@ -72,6 +72,10 @@ def _spans(page) -> list[TextSpan]:
             for span in pending[1:]: box = _union(box, span.box)
             seed = any(span.math for span in pending) or text in {"=", "+", "≤", "≥", "∑", "∫", "√", "±", "×"}
             seed = seed or (len(text) == 1 and text.isalpha() and bool(re.search("Italic|Oblique", first.font_name, re.I)))
+            # Operators in a monospaced program are source code, not formula
+            # seeds. Cropping `p =` out of a C declaration destroys the program.
+            if re.search(r"Courier|Mono|Consolas", first.font_name, re.I):
+                seed = False
             result.append(TextSpan(first.index, text, box, seed, max(s.font_size for s in pending),
                                    first.baseline, first.font_name))
         pending, category = [], ""
@@ -194,7 +198,22 @@ def _groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
         else:
             groups.append([span])
         previous_math = True
-    return groups
+    # PDF content streams often emit a summation's lower bound before the
+    # fraction and its cases in another text object. Stream adjacency alone
+    # splits one displayed equation into overlapping, incomplete snapshots.
+    merged: list[list[TextSpan]] = []
+    for group in groups:
+        box = _group_box(group)
+        while True:
+            touching = next((i for i, other in enumerate(merged)
+                             if _intersection(box, _group_box(other)) >
+                             min(_area(box), _area(_group_box(other))) * .08), None)
+            if touching is None:
+                break
+            group = sorted(merged.pop(touching) + group, key=lambda s: s.index)
+            box = _group_box(group)
+        merged.append(group)
+    return sorted(merged, key=lambda group: group[0].index)
 
 
 def _group_box(group: list[TextSpan]) -> Box:
@@ -364,6 +383,46 @@ def _complete_region(box: Box, nodes: list[dict]) -> Box:
             return box
 
 
+def _recover_code(page, nodes: list[dict]) -> None:
+    """Keep monospaced listings as complete fenced blocks with source newlines."""
+    candidates = [n for n in nodes if re.search(r"Courier|Mono|Consolas", n.get("font") or "", re.I)
+                  and n.get("content") and _box(n)]
+    groups: list[list[dict]] = []
+    for node in sorted(candidates, key=lambda n: -_box(n)[3]):
+        box = _box(node)
+        if groups:
+            previous = _group_node_box(groups[-1])
+            size = float(node.get("font size") or 10)
+            if -2 <= previous[1] - box[3] <= size * 1.6 and abs(previous[0] - box[0]) < size * 6:
+                groups[-1].append(node)
+                continue
+        groups.append([node])
+    textpage = page.get_textpage()
+    try:
+        for group in groups:
+            box = _group_node_box(group)
+            text = textpage.get_text_bounded(box[0] - .5, box[1] - .5,
+                                             box[2] + .5, box[3] + .5).replace("\r\n", "\n").strip()
+            if not re.search(r"[{};]|\b(?:def|function|return|include)\b", text):
+                continue
+            if len(text.splitlines()) < 2:
+                continue
+            owner = group[0]
+            owner.update({"type": "code", "content": "```\n" + text + "\n```", "bounding box": list(box)})
+            for node in group[1:]:
+                node["content"] = ""
+                node["suppressed"] = True
+    finally:
+        textpage.close()
+
+
+def _group_node_box(nodes: list[dict]) -> Box:
+    box = _box(nodes[0])
+    for node in nodes[1:]:
+        box = _union(box, _box(node))
+    return box
+
+
 def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
     """Insert faithful inline PNG equations, keeping ordinary text editable."""
     with pdf_path.open("rb") as file:
@@ -409,6 +468,7 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     continue
                 figure_boxes = [_box(f) for f in figures if f["page number"] == page_number]
                 nodes = by_page.get(page_number, [])
+                _recover_code(page, nodes)
                 document["deduplicated figure text"] = document.get("deduplicated figure text", 0) + _remove_figure_duplicates(
                     nodes, spans, figure_boxes)
                 spans = [span for span in spans if not any(

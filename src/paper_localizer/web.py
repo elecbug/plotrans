@@ -27,6 +27,8 @@ def main() -> None:
         ocr_mode = st.selectbox("OCR 처리", ["auto","off","force"],
                                 help="auto: 해독 불가·스캔 페이지 자동 처리, off: 사용 안 함, force: 모든 페이지")
         ocr_dpi = st.slider("OCR 해상도 (DPI)", 96, 400, 216, 8)
+        vision_model = st.text_input("고품질 문서 OCR 모델 (선택)", "",
+            help="glm-ocr:latest를 설치한 뒤 입력하면 수식·OCR 문장을 추가 검증합니다. 빈 값이면 CPU OCR만 사용합니다.")
     if st.button("분석 및 번역", disabled=uploaded is None, type="primary") and uploaded:
         bar = st.progress(0, text="준비 중")
 
@@ -42,7 +44,7 @@ def main() -> None:
                     source, destination, translation_model=translation_model,
                     summary_model=summary_model, target_language=target_language,
                     chunk_size=chunk_size, ollama_url=ollama_url, progress=update,
-                    ocr=OcrOptions(mode=ocr_mode,dpi=ocr_dpi),
+                    ocr=OcrOptions(mode=ocr_mode,dpi=ocr_dpi,vision_model=vision_model,vision_url=ollama_url),
                 )
             except (ProcessingError, ValueError) as exc:
                 st.error(str(exc))

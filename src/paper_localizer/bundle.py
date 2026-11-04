@@ -27,6 +27,9 @@ def build_bundle(markdown_path: Path) -> bytes:
     references = {image_reference(match).source for match in FIGURE_LINK.finditer(markdown + "\n" + html)}
     with ZipFile(stream, "w", ZIP_DEFLATED) as archive:
         archive.writestr(markdown_path.name, markdown.encode("utf-8"))
+        ocr_report = markdown_path.with_suffix(".ocr.json")
+        if ocr_report.is_file():
+            archive.write(ocr_report, ocr_report.name)
         if html:
             archive.writestr(html_path.name, html.encode("utf-8"))
             for reference in sorted(set(re.findall(r'href="(assets/[A-Za-z0-9_./-]+)"', html))):

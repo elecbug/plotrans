@@ -11,6 +11,7 @@
 - 요약: `qwen3:4b`
 - 화면: `streamlit==1.66.1`
 - 문서 렌더링: `markdown-it-py==4.0.0`, `mdurl==0.1.2`
+- 수식 렌더링: `latex2mathml==3.78.1` (외부 JavaScript 없이 MathML 출력)
 - Python: 3.11 이상, 권장 3.12 / Java: 11 이상, 권장 17
 - 기본 번역 언어: 영어 (`--target-language`로 변경 가능)
 - 출력 문서의 제목·메뉴·설명·그림 표기는 영어로 제공하며, 그림은 `Fig.`로 표기합니다.
@@ -94,6 +95,50 @@ paper-localizer extract "paper.pdf" -o outputs/native.extracted.md --ocr-mode of
 OCR 문단은 페이지 좌표를 사용해 읽기 순서와 단을 재구성합니다. 그림 탐색 마스크에서 OCR 글자를 지워 스캔 페이지 전체가 하나의 그림으로 분류되는 현상을 방지합니다. 실제 그림은 원본에서 잘라 내므로 그림 내부 레이블은 유지합니다. 수식으로 판단한 행과 신뢰도가 낮은 행은 전체를 원문 이미지로 보존하고 번역 모델에 보내지 않습니다. 따라서 해당 행의 문장 일부는 번역되지 않을 수 있습니다. HTML과 Markdown의 접힌 **Original pages used for OCR** 영역에서 모든 OCR 원본 페이지를 대조할 수 있으며 ZIP에도 포함됩니다.
 
 원시 OCR 결과는 출력 폴더의 `.ocr-cache/`에 PDF 내용·엔진 버전·DPI를 기준으로 저장합니다. 문단 배치와 신뢰도 기준은 캐시를 사용해도 다시 적용합니다. OCR 신뢰도는 정확도 보장이 아니며, 복잡한 수식의 자동 LaTeX 변환과 복잡한 표의 셀 복원은 수행하지 않습니다. 이 경로는 Kademlia 13쪽과 합성 스캔 PDF로 실제 로컬 추론을 검증했습니다.
+
+### 고품질 문서·수식 OCR (선택)
+
+일반 OCR이 놓치는 지수·첨자와 수식이 섞인 문장은 로컬 Ollama의 `glm-ocr:latest`로 추가 검증할 수 있습니다. 번역 모델은 HY-MT2-7B로 유지합니다. GLM-OCR는 별도의 문서 인식 모델이며, 처음에 가중치를 내려받은 뒤에는 원문을 외부 서비스로 전송하지 않습니다. Python에 PyTorch를 추가 설치할 필요가 없습니다.
+
+```sh
+ollama pull glm-ocr:latest
+paper-localizer doctor --ocr --skip-ollama --vision-ocr-model glm-ocr:latest
+paper-localizer extract "paper.pdf" -o outputs/paper.extracted.md --vision-ocr-model glm-ocr:latest
+paper-localizer run "paper.pdf" -o outputs/paper.translated.md --vision-ocr-model glm-ocr:latest
+```
+
+Docker에서는 `docker compose exec ollama ollama pull glm-ocr:latest`로 모델을 준비하고, 웹 화면의 **고품질 문서 OCR 모델**에 `glm-ocr:latest`를 입력합니다. GPU가 없으면 CPU로 실행되며 처리 시간이 늘어납니다. 독립적인 OCR 서버를 사용하려면 `--vision-ocr-url`로 주소를 지정합니다. 기본 CPU 추출은 이 옵션 없이 계속 동작합니다.
+
+원본 PDF에서 수식을 4배·6배 해상도로 다시 렌더링하고, 서로 다르면 8배로 재검사합니다. 인접 문자가 섞이지 않도록 수식의 소유 영역 바깥에는 흰 여백만 추가합니다. 해독 가능한 단일 행 수식은 원본 Unicode와 문자별 크기를 우선 확인하며, 나머지는 해상도 간 결과와 원본의 읽을 수 있는 숫자·변수를 비교합니다. 반복되는 짧은 수식은 검증을 통과한 동일 PDF의 수식과 전체 이미지·각 글리프를 함께 대조합니다.
+
+검증을 통과한 OCR 본문은 LaTeX 수식과 함께 편집 가능한 텍스트로 복원하고, HTML·Markdown에서는 오프라인 MathML로 표시합니다. 원래 수식 이미지는 제 위치에 유지하며, 그 의미를 번역·요약 모델에도 제공합니다. 복원한 원본 영역은 접힌 대조 영역에 남깁니다. 판단이 일치하지 않는 수식은 이미지로 유지하고 모델이 내용을 추측하지 않도록 표시합니다. 일치 검사는 정확도 보장이 아닙니다.
+
+출력의 `.ocr.json`과 ZIP에는 모델의 실제 SHA-256 digest, 전처리 프로필, 영역별 판정과 수식 전사가 저장됩니다. `.vision-cache/`는 PDF·모델 digest·영역·해상도·프로필을 키로 사용합니다. 재현 시 `--vision-ocr-digest`로 모델 버전까지 검증할 수 있습니다. 이번 실험의 모델 digest는 다음과 같습니다.
+
+```text
+89d735dd9c07791953756edd275e5501464df61288b1cd5486c5c50c8c058b32
+```
+
+[GLM-OCR 공식 Ollama 실행 안내](https://github.com/zai-org/GLM-OCR/blob/main/examples/ollama-deploy/README.md)를 바탕으로 Ollama의 `/api/generate`를 사용합니다. 수식 전용 [RapidLaTeXOCR](https://github.com/RapidAI/RapidLaTeXOCR)도 비교했지만, 복잡한 구간별 함수에서 괄호 구조를 잘못 생성해 기본 처리기로 채택하지 않았습니다.
+
+```sh
+python scripts/audit_corpus.py .tmp/example --output outputs/quality --only Kademlia,Bitcoin,Pastry --vision-ocr-model glm-ocr:latest --sheets
+python scripts/benchmark_quality.py outputs/quality
+```
+
+두 번째 명령은 원본을 확인해 만든 21개 의미 회귀 항목과 Bitcoin 확률 표의 6개 독립 재계산을 평가합니다. 통과율을 전체 논문 정확도로 해석하면 안 됩니다. 번역·요약 모델의 실제 출력 품질은 별도의 평가가 필요합니다.
+
+수식 전용 OCR 비교는 별도의 가상 환경에서 재현합니다. 기본 OCR의 NumPy/OpenCV 버전과 섞지 마세요. Python 3.12에서 아래 요구사항 파일을 설치한 뒤 실행합니다.
+
+```sh
+python -m venv .tmp/math-benchmark
+# Windows: .tmp/math-benchmark/Scripts/activate
+# macOS/Linux: source .tmp/math-benchmark/bin/activate
+python -m pip install -r scripts/requirements-math-benchmark.txt
+python scripts/compare_formula_ocr.py .tmp/example --download-models
+```
+
+모델 4개는 `scripts/math-ocr-models.json`의 SHA-256으로 검증하며, 다음 실행부터는 `--download-models` 없이 오프라인으로 비교할 수 있습니다. `--scale 4`로 원본 렌더링 해상도의 영향을 비교할 수 있습니다.
 
 ### 포함된 예시로 확인
 

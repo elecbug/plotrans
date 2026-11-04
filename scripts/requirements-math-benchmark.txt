@@ -1,0 +1,12 @@
+# Isolated experiment only; production OCR keeps its own NumPy/OpenCV versions.
+rapid-latex-ocr==0.0.9
+onnxruntime==1.23.2
+tokenizers==0.21.4
+numpy==1.26.4
+opencv-python==4.11.0.86
+Pillow==12.3.0
+PyYAML==6.0.3
+requests==2.32.5
+chardet==5.2.0
+tqdm==4.67.1
+pypdfium2==5.14.0

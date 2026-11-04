@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from html import escape
 from importlib.resources import files
+import json
 from pathlib import Path
 import re
 
 from markdown_it import MarkdownIt
 
 from .markup import FIGURE_LINK, image_reference, inline_image_tag
+from .math_markup import LATEX, expression, mathml, render_math
 
 
 _MARKDOWN = MarkdownIt("commonmark", {"html": True}).enable("table")
@@ -52,6 +54,7 @@ class Article:
     title_markup: str = ""
     warnings: list[str] = field(default_factory=list)
     ocr_sources: list[dict] = field(default_factory=list)
+    vision_sources: list[dict] = field(default_factory=list)
 
 
 def _plain(text: str) -> str:
@@ -77,6 +80,10 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
         article.warnings.append("Pages " + ", ".join(map(str, pages)) +
                                 " use an undecodable font. Complete source pages are preserved as images; OCR is required to translate their text.")
     article.ocr_sources = document.get("ocr sources", [])
+    article.vision_sources = document.get("vision sources", [])
+    if vision := document.get("vision ocr"):
+        rejected = sum(not region["accepted"] for region in vision["regions"])
+        article.warnings.append(f"Local vision OCR: {vision['model']}. {rejected} region(s) failed consistency checks and retain their source representation. OCR consistency does not guarantee correctness.")
     if pages := document.get("ocr pages"):
         article.warnings.append("Local CPU OCR was used on pages " + ", ".join(map(str,pages)) +
             ". OCR can misread text. Original pages are available below; uncertain text and notation are preserved as source images.")
@@ -105,7 +112,7 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
                 append(unit)
             pending_figure = None
             continue
-        if chunk.kind in {"figure", "formula"}:
+        if chunk.kind in {"figure", "formula", "code"}:
             if document.get("source image pages") and current is None:
                 current = Section("Source pages", "source-pages")
                 article.sections.append(current); abstract_mode = False
@@ -159,8 +166,17 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
 
 def _safe_markdown(text: str) -> str:
     parts, cursor = [], 0
-    for match in FIGURE_LINK.finditer(text):
+    tokens = [(match.start(), match, "image") for match in FIGURE_LINK.finditer(text)]
+    tokens += [(match.start(), match, "math") for match in LATEX.finditer(text)
+               if not any(image.start() <= match.start() < image.end() for image in FIGURE_LINK.finditer(text))]
+    for _, match, kind in sorted(tokens, key=lambda item: item[0]):
+        if match.start() < cursor: continue
         parts.append(escape(text[cursor:match.start()], quote=False))
+        if kind == "math":
+            try: parts.append(mathml(expression(match), bool(match.group(1) or match.group(4))))
+            except Exception: parts.append(escape(match.group(0)))
+            cursor = match.end()
+            continue
         ref = image_reference(match)
         if ref.inline:
             parts.append(inline_image_tag(ref.source, ref.alt, ref.height_em, ref.align_em, ref.aspect_ratio))
@@ -178,9 +194,9 @@ def _md_html(text: str, inline: bool = False) -> str:
 
 def _unit_markdown(unit: Unit) -> str:
     page = ", ".join(map(str, unit.pages))
-    text = f"<!-- p.{page} -->\n\n" + unit.source
+    text = f"<!-- p.{page} -->\n\n" + (unit.source if unit.kind == "code" else render_math(unit.source))
     if unit.translation:
-        text += "\n\n<details>\n<summary>Translation</summary>\n\n" + unit.translation + "\n\n</details>"
+        text += "\n\n<details>\n<summary>Translation</summary>\n\n" + render_math(unit.translation) + "\n\n</details>"
     if unit.caption:
         text += "\n\n" + _unit_markdown(unit.caption)
     return text
@@ -212,12 +228,20 @@ def article_markdown(article: Article) -> str:
         for source in article.ocr_sources:
             lines.extend([f"![Original source page {source['page']}]({source['source']})", ""])
         lines.extend(["</details>", ""])
+    if article.vision_sources:
+        lines.extend(["<details>", "<summary>Source regions transcribed by vision OCR</summary>", ""])
+        for source in article.vision_sources:
+            lines.extend([f"![Source region p.{source['page']}]({source['source']})", ""])
+        lines.extend(["</details>", ""])
     lines.extend(["---", "", "Extracted from the source PDF. Equation images preserve the original notation.", ""])
     return "\n".join(lines)
 
 
 def _unit_html(unit: Unit) -> str:
     pages = ", ".join(map(str, unit.pages))
+    if unit.kind == "code":
+        source = re.sub(r"^```[^\n]*\n|\n```$", "", unit.source)
+        return '<pre><code>' + escape(source) + f'</code></pre><span class="page-reference">p.{pages}</span>'
     if unit.kind == "figure":
         match = next(FIGURE_LINK.finditer(unit.source), None)
         if not match: return ""
@@ -269,6 +293,12 @@ def article_html(article: Article, markdown_name: str) -> str:
             body += (f'<figure><a href="{escape(source["source"])}"><img src="{escape(source["source"])}" '
                      f'alt="Original source page {source["page"]}" loading="lazy"></a><figcaption>Source page {source["page"]}</figcaption></figure>')
         body += '</details>'
+    if article.vision_sources:
+        body += '<details class="ocr-sources"><summary>Source regions transcribed by vision OCR</summary>'
+        for source in article.vision_sources:
+            body += (f'<figure><img src="{escape(source["source"])}" alt="Source region p.{source["page"]}" loading="lazy">'
+                     f'<figcaption>Source page {source["page"]}</figcaption></figure>')
+        body += '</details>'
     checked_source = "" if article.translated else "checked"
     checked_both = "checked" if article.translated else ""
     controls = ('<label for="view-source">Original</label><label for="view-translated">Translation</label>'
@@ -305,6 +335,12 @@ def write_article(document: dict, title: str, filename: str, chunks, translation
                               (output.with_suffix(".html"), article_html(article, output.name))]:
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         temporary.write_text(text, encoding="utf-8"); temporary.replace(destination)
+    ocr_report = output.with_suffix(".ocr.json")
+    if vision := document.get("vision ocr"):
+        ocr_report.write_text(json.dumps({"vision": vision, "equations": document.get("math transcriptions", {})},
+                                        ensure_ascii=False, indent=2), encoding="utf-8")
+    else:
+        ocr_report.unlink(missing_ok=True)
     from .bundle import build_bundle
     output.with_suffix(".zip").write_bytes(build_bundle(output))
     return output
