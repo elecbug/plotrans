@@ -9,6 +9,7 @@ import streamlit as st
 
 from paper_localizer.core import (OLLAMA_URL, SUMMARY_MODEL, TRANSLATION_MODEL,
                                   ProcessingError, process_pdf)
+from paper_localizer.bundle import FIGURE_LINK, build_bundle, figure_path
 
 
 def main() -> None:
@@ -43,12 +44,25 @@ def main() -> None:
             else:
                 st.session_state["markdown"] = result.read_bytes()
                 st.session_state["filename"] = result.name
+                st.session_state["bundle"] = build_bundle(result)
+                st.session_state["result_path"] = str(result)
                 st.success(f"완료: {result.resolve()}")
     if "markdown" in st.session_state:
+        if "bundle" in st.session_state:
+            st.download_button("Markdown + 그림 ZIP 다운로드", st.session_state["bundle"],
+                               file_name=Path(st.session_state["filename"]).stem + ".zip",
+                               mime="application/zip")
         st.download_button("Markdown 다운로드", st.session_state["markdown"],
                            file_name=st.session_state["filename"], mime="text/markdown")
         with st.expander("결과 미리보기"):
-            st.markdown(st.session_state["markdown"].decode("utf-8"))
+            markdown = st.session_state["markdown"].decode("utf-8")
+            cursor = 0
+            for match in FIGURE_LINK.finditer(markdown):
+                st.markdown(markdown[cursor:match.start()])
+                image_path = figure_path(Path(st.session_state["result_path"]), match.group(2))
+                st.image(str(image_path), caption=match.group(1))
+                cursor = match.end()
+            st.markdown(markdown[cursor:])
 
 
 if __name__ == "__main__":

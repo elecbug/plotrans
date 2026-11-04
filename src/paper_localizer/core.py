@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from .figures import attach_figures
+
 
 TRANSLATION_MODEL = "kaelri/hy-mt2:7b-q4_K_M"
 SUMMARY_MODEL = "qwen3:4b"
@@ -36,6 +38,7 @@ class Chunk:
     index: int
     pages: tuple[int, ...]
     source: str
+    kind: str = "text"
 
 
 def _descendant_text(node: dict) -> str:
@@ -76,6 +79,12 @@ def extract_blocks(document: dict) -> list[Block]:
         page = node.get("page number", inherited_page)
         page = page if isinstance(page, int) and page > 0 else inherited_page
         if kind in {"header", "footer"}:
+            return
+        if kind in {"image", "picture"}:
+            source = node.get("source")
+            if isinstance(source, str) and source.startswith("figs/"):
+                alt = str(node.get("alt", f"그림 p.{page}")).replace("[", "").replace("]", "")
+                blocks.append(Block(page, "image", f"![{alt}]({source})"))
             return
         if kind == "table":
             table = _table_markdown(node)
@@ -134,6 +143,10 @@ def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
         lines, pages, size = [], set(), 0
 
     for block in blocks:
+        if block.kind == "image":
+            flush()
+            chunks.append(Chunk(len(chunks) + 1, (block.page,), block.text, "figure"))
+            continue
         for part in _split_text(block.text, limit):
             if size + len(part) + 2 > limit:
                 flush()
@@ -188,7 +201,7 @@ class OllamaClient:
         return answer
 
 
-def parse_pdf(pdf_path: Path) -> dict:
+def parse_pdf(pdf_path: Path, output_dir: Path | None = None) -> dict:
     try:
         import opendataloader_pdf
     except ImportError as exc:
@@ -201,7 +214,8 @@ def parse_pdf(pdf_path: Path) -> dict:
         output.mkdir()
         try:
             opendataloader_pdf.convert(
-                input_path=str(source), output_dir=str(output), format="json", quiet=True
+                input_path=str(source), output_dir=str(output), format="json", quiet=True,
+                image_output="external", image_format="png",
             )
         except Exception as exc:
             raise ProcessingError(f"OpenDataLoader 변환 실패: {exc}") from exc
@@ -209,7 +223,11 @@ def parse_pdf(pdf_path: Path) -> dict:
         if not result.exists():
             raise ProcessingError("OpenDataLoader가 JSON 파일을 만들지 못했습니다. PDF 상태를 확인하세요.")
         with result.open(encoding="utf-8") as file:
-            return json.load(file)
+            document = json.load(file)
+        try:
+            return attach_figures(pdf_path, document, output_dir or Path("outputs"))
+        except Exception as exc:
+            raise ProcessingError(f"그림 영역 추출 실패: {exc}") from exc
 
 
 def _translation_prompt(source: str, target_language: str) -> str:
@@ -274,6 +292,9 @@ def render_markdown(document: dict, pdf_name: str, chunks: list[Chunk],
     ]
     for chunk, translated in zip(chunks, translations, strict=True):
         page_label = ", ".join(map(str, chunk.pages))
+        if chunk.kind == "figure":
+            lines.extend([f"### 그림 · p.{page_label}", "", chunk.source, ""])
+            continue
         lines.extend([
             f"### 청크 {chunk.index} · p.{page_label}", "", "**원문**", "",
             chunk.source, "", f"**{language} 번역**", "", translated, "",
@@ -292,7 +313,7 @@ def extract_pdf(pdf_path: Path, output_path: Path, *, chunk_size: int = 1800) ->
         raise ProcessingError("존재하는 PDF 파일을 지정하세요.")
     if output_path.suffix.lower() != ".md":
         raise ProcessingError("출력 파일 확장자는 .md여야 합니다.")
-    document = parse_pdf(pdf_path)
+    document = parse_pdf(pdf_path, output_path.parent)
     chunks = make_chunks(extract_blocks(document), chunk_size)
     if not chunks:
         raise ProcessingError("추출한 본문 텍스트가 없습니다. 스캔 PDF라면 OCR 처리가 필요합니다.")
@@ -300,7 +321,8 @@ def extract_pdf(pdf_path: Path, output_path: Path, *, chunk_size: int = 1800) ->
     lines = [f"# {title}", "", f"원본: `{pdf_path.name}`", "", "## 추출 원문", ""]
     for chunk in chunks:
         pages = ", ".join(map(str, chunk.pages))
-        lines.extend([f"### 청크 {chunk.index} · p.{pages}", "", chunk.source, ""])
+        label = "그림" if chunk.kind == "figure" else f"청크 {chunk.index}"
+        lines.extend([f"### {label} · p.{pages}", "", chunk.source, ""])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines), encoding="utf-8")
     return output_path
@@ -313,7 +335,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
                 chunk_size: int = 1800,
                 ollama_url: str = OLLAMA_URL,
                 progress: Callable[[str, int, int], None] | None = None,
-                parser: Callable[[Path], dict] = parse_pdf,
+                parser: Callable[[Path], dict] | None = None,
                 client: OllamaClient | None = None) -> Path:
     pdf_path = Path(pdf_path)
     output_path = Path(output_path)
@@ -331,7 +353,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
     client.check_models(translation_model, summary_model)
     if progress:
         progress("PDF 분석", 0, 1)
-    document = parser(pdf_path)
+    document = parser(pdf_path) if parser else parse_pdf(pdf_path, output_path.parent)
     blocks = extract_blocks(document)
     if not blocks:
         raise ProcessingError("추출한 본문 텍스트가 없습니다. 스캔 PDF라면 OCR 처리가 필요합니다.")
@@ -345,6 +367,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
         "target_language": target_language,
         "chunk_size": chunk_size,
         "sources": [chunk.source for chunk in chunks],
+        "kinds": [chunk.kind for chunk in chunks],
     }
     checkpoint = output_path.with_suffix(".progress.json")
     translations: list[str] = []
@@ -364,12 +387,16 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
             continue
         if progress:
             progress("번역 및 요약", index, len(chunks))
-        translations.append(client.chat(
-            translation_model, _translation_prompt(chunk.source, target_language), translation=True
-        ))
-        notes.append(client.chat(
-            summary_model, _summary_prompt(chunk.source, chunk.pages, target_language)
-        ))
+        if chunk.kind == "figure":
+            translations.append(chunk.source)
+            notes.append("없음")
+        else:
+            translations.append(client.chat(
+                translation_model, _translation_prompt(chunk.source, target_language), translation=True
+            ))
+            notes.append(client.chat(
+                summary_model, _summary_prompt(chunk.source, chunk.pages, target_language)
+            ))
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
         checkpoint.write_text(json.dumps({"identity": identity, "translations": translations,
                                           "notes": notes}, ensure_ascii=False), encoding="utf-8")
