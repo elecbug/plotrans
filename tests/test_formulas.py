@@ -24,15 +24,18 @@ def math_fixture(path: Path) -> dict:
     resources = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): normal})})
     glyph = DecodedStreamObject()
     glyph.set_data(b"2000 0 0 -200 2000 800 d1 BT /F1 1000 Tf 0 0 Td (b=4) Tj ET")
+    symbol = DecodedStreamObject()
+    symbol.set_data(b"700 0 0 -200 700 800 d1 BT /F1 1000 Tf 0 0 Td (N) Tj ET")
     math_font = DictionaryObject({
         NameObject("/Type"): NameObject("/Font"), NameObject("/Subtype"): NameObject("/Type3"),
         NameObject("/FontBBox"): ArrayObject([NumberObject(n) for n in [0, -200, 2000, 800]]),
         NameObject("/FontMatrix"): ArrayObject([FloatObject(n) for n in [.001, 0, 0, .001, 0, 0]]),
-        NameObject("/FirstChar"): NumberObject(1), NameObject("/LastChar"): NumberObject(1),
-        NameObject("/Widths"): ArrayObject([NumberObject(2000)]),
+        NameObject("/FirstChar"): NumberObject(1), NameObject("/LastChar"): NumberObject(2),
+        NameObject("/Widths"): ArrayObject([NumberObject(2000), NumberObject(700)]),
         NameObject("/Encoding"): DictionaryObject({NameObject("/Differences"):
-                                                    ArrayObject([NumberObject(1), NameObject("/equation")])}),
-        NameObject("/CharProcs"): DictionaryObject({NameObject("/equation"): writer._add_object(glyph)}),
+                                                    ArrayObject([NumberObject(1), NameObject("/equation"), NameObject("/symbolN")])}),
+        NameObject("/CharProcs"): DictionaryObject({NameObject("/equation"): writer._add_object(glyph),
+                                                   NameObject("/symbolN"): writer._add_object(symbol)}),
         NameObject("/Resources"): resources,
     })
     page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): DictionaryObject({
@@ -42,6 +45,8 @@ def math_fixture(path: Path) -> dict:
         b"BT /F1 12 Tf 30 180 Td (Fig.7. Quality of routing tables, ) Tj "
         b"/M0 12 Tf <01> Tj /F1 12 Tf (, and 5,000 nodes.) Tj ET "
         b"BT /F1 12 Tf 30 130 Td (Normal prose with a legacy\002soft hyphen stays editable.) Tj ET "
+        b"BT /F1 12 Tf 30 100 Td (Complexity is O\\(log ) Tj /M0 12 Tf <02> Tj "
+        b"/F1 12 Tf (\\) + 1.) Tj ET "
         b"BT /M0 16 Tf 80 60 Td <01> Tj ET"
     )
     page[NameObject("/Contents")] = writer._add_object(stream)
@@ -52,6 +57,8 @@ def math_fixture(path: Path) -> dict:
          "content": "Fig.7. Quality of routing tables, , and 5,000 nodes."},
         {"type": "paragraph", "page number": 1, "bounding box": [30, 126, 500, 144],
          "content": "Normal prose with a legacy soft hyphen stays editable."},
+        {"type": "paragraph", "page number": 1, "bounding box": [30, 96, 500, 114],
+         "content": "Complexity is O(log ) + 1."},
     ]}
 
 
@@ -60,7 +67,7 @@ class FormulaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory); source = root / "formula.pdf"
             document = recover_formulas(source, math_fixture(source), root)
-            self.assertEqual(len(document["formulas"]), 2)
+            self.assertEqual(len(document["formulas"]), 3)
             caption = next(n for n in document["kids"] if n.get("type") == "caption")["content"]
             self.assertRegex(caption, r'tables, <img\b[^>]+/>, and 5,000 nodes\.')
             reference = image_reference(next(FIGURE_LINK.finditer(caption)))
@@ -71,6 +78,9 @@ class FormulaTests(unittest.TestCase):
             self.assertTrue(all((root / f["source"]).is_file() for f in document["formulas"]))
             self.assertIn("Normal prose with a legacy soft hyphen stays editable.",
                           [b.text for b in extract_blocks(document)])
+            complexity = next(n["content"] for n in document["kids"] if n.get("content", "").startswith("Complexity"))
+            self.assertRegex(complexity, r'^Complexity is <img\b[^>]+/>\.$')
+            self.assertEqual(len(list(FIGURE_LINK.finditer(complexity))), 1)
             self.assertTrue(any(b.kind == "formula" for b in extract_blocks(document)))
             preview = inline_equation_preview(root / "paper.md", caption)
             self.assertIn("data:image/png;base64,", preview)

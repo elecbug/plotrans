@@ -16,7 +16,7 @@ from .markup import FIGURE_LINK, image_reference, inline_image_tag
 _MARKDOWN = MarkdownIt("commonmark", {"html": True}).enable("table")
 _HEADING = re.compile(r"^(#{1,6})\s+(.+)$")
 _ABSTRACT = re.compile(r"^(?:Abstract|초록)\s*[.：:\-—]?\s*", re.I)
-_CAPTION = re.compile(r"^(?:-\s*)?(?:Fig(?:ure)?\.?|Table|그림|표)\s*\d", re.I)
+_CAPTION = re.compile(r"^(?:-\s*)?(?:Fig(?:ure)?\.?|Table|그림|표)\s*\d+", re.I)
 
 
 @dataclass
@@ -114,6 +114,7 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
             if not source.strip(): continue
             unit = Unit(source, target, pages=chunk.pages)
             if _ABSTRACT.match(source) and current is None:
+                abstract_mode = True
                 unit.source = _ABSTRACT.sub("", source, count=1)
                 unit.translation = _ABSTRACT.sub("", target, count=1)
                 article.abstract.append(unit)

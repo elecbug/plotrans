@@ -113,8 +113,10 @@ class FigureTests(unittest.TestCase):
             self.assertEqual(markdown.count("!["), 2)
             self.assertTrue(all("figs/" not in prompt for prompt in client.prompts))
             with ZipFile(BytesIO(build_bundle(output))) as archive:
-                self.assertEqual(len(archive.namelist()), 3)
+                self.assertEqual(len(archive.namelist()), 5)
                 self.assertIn("result.md", archive.namelist())
+                self.assertIn("result.html", archive.namelist())
+                self.assertIn("assets/article.css", archive.namelist())
                 self.assertTrue(all(f["source"] in archive.namelist() for f in document["figures"]))
 
     def test_bundle_rejects_paths_outside_figs(self):
