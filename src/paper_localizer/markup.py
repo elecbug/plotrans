@@ -47,7 +47,7 @@ def image_reference(match: re.Match) -> ImageReference:
     align = re.search(r"(?:^|;)\s*vertical-align\s*:\s*([-+0-9.]+)em", style)
     try:
         aspect = float(attrs.get("width", "16")) / max(float(attrs.get("height", "16")), 1)
-        return ImageReference(source, attrs.get("alt", "수식"), True,
+        return ImageReference(source, attrs.get("alt", "Equation"), True,
                               float(height.group(1)) if height else 1.0,
                               float(align.group(1)) if align else -0.15, aspect)
     except (TypeError, ValueError) as exc:

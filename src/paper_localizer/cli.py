@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("-o", "--output", type=Path)
     run.add_argument("--translation-model", default=TRANSLATION_MODEL)
     run.add_argument("--summary-model", default=SUMMARY_MODEL)
-    run.add_argument("--target-language", default="Korean")
+    run.add_argument("--target-language", default="English")
     run.add_argument("--chunk-size", type=int, default=1800)
     run.add_argument("--ollama-url", default=OLLAMA_URL)
     extract = sub.add_parser("extract", help="Ollama 없이 PDF 추출 결과만 확인")
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
             path = extract_pdf(args.pdf, output, chunk_size=args.chunk_size)
             print(f"추출 완료: {path.resolve()}\nHTML: {path.with_suffix('.html').resolve()}\nZIP: {path.with_suffix('.zip').resolve()}")
             return 0
-        output = args.output or Path("outputs") / f"{args.pdf.stem}.ko.md"
+        output = args.output or Path("outputs") / f"{args.pdf.stem}.translated.md"
         path = process_pdf(
             args.pdf, output, translation_model=args.translation_model,
             summary_model=args.summary_model, target_language=args.target_language,

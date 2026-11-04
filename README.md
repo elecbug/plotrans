@@ -1,6 +1,6 @@
-# 논문 로컬 번역기
+# PLoTrans
 
-논문 PDF를 OpenDataLoader PDF로 구조화하고, Tencent HY-MT2-7B로 번역하며, 별도의 로컬 요약 모델로 핵심 내용을 정리합니다. 결과 Markdown에는 페이지 표시와 함께 원문 청크 및 번역 청크가 순서대로 담깁니다. PDF 내용은 OpenDataLoader와 로컬 Ollama에만 전달됩니다.
+논문 PDF를 OpenDataLoader PDF로 구조화하고, Tencent HY-MT2-7B로 번역하며, 별도의 로컬 요약 모델로 핵심 내용을 정리합니다. 제목·초록·목차·절·그림 및 캡션·참고문헌을 갖춘 Markdown과 HTML을 함께 생성합니다. PDF 내용은 로컬 처리기와 Ollama에만 전달됩니다.
 
 ## 구성
 
@@ -9,8 +9,10 @@
 - 번역: Tencent `Hy-MT2-7B` 공식 GGUF 가중치를 Ollama용 템플릿으로 감싼 `kaelri/hy-mt2:7b-q4_K_M`
 - 요약: `qwen3:4b`
 - 화면: `streamlit==1.66.1`
+- 문서 렌더링: `markdown-it-py==4.0.0`, `mdurl==0.1.2`
 - Python: 3.11 이상, 권장 3.12 / Java: 11 이상, 권장 17
-- 기본 번역 언어: 한국어
+- 기본 번역 언어: 영어 (`--target-language`로 변경 가능)
+- 출력 문서의 제목·메뉴·설명·그림 표기는 영어로 제공하며, 그림은 `Fig.`로 표기합니다.
 
 기본 모델 태그는 [HY-MT2 Ollama 배포 페이지](https://ollama.com/kaelri/hy-mt2)에서 확인할 수 있습니다. Tencent의 [공식 모델 페이지](https://huggingface.co/tencent/Hy-MT2-7B)는 번역 프롬프트와 권장 추론 설정을 제공합니다. 다른 태그를 이미 보유하셨다면 CLI의 `--translation-model` 또는 화면의 설정에서 지정할 수 있습니다.
 
@@ -25,7 +27,7 @@ docker compose exec ollama ollama pull qwen3:4b
 docker compose up --build -d app
 ```
 
-브라우저에서 <http://127.0.0.1:8501>을 열고 PDF를 선택한 다음 **분석 및 번역**을 누르세요. 완료된 Markdown과 그림은 화면의 **Markdown + 그림 ZIP 다운로드**로 함께 내려받거나 프로젝트의 `outputs/` 폴더에서 찾을 수 있습니다. 종료 명령은 `docker compose down`입니다. 모델은 Docker 볼륨에 유지됩니다.
+브라우저에서 <http://127.0.0.1:8501>을 열고 PDF를 선택한 다음 **분석 및 번역**을 누르세요. 완료된 문서는 화면의 **논문 패키지 ZIP 다운로드**로 함께 내려받거나 프로젝트의 `outputs/` 폴더에서 찾을 수 있습니다. ZIP에는 Markdown, HTML, 공통 CSS와 모든 이미지가 포함됩니다. 종료 명령은 `docker compose down`입니다. 모델은 Docker 볼륨에 유지됩니다.
 
 Docker 설정은 Ollama `0.40.14`와 Python `3.12` 기반 이미지를 사용합니다. GPU 없이도 실행할 수 있지만 7B 모델은 상당한 메모리와 시간이 필요합니다. 환경에 따라 Docker의 메모리 한도를 늘려 주세요.
 
@@ -66,7 +68,7 @@ Ollama가 실행 중이지 않으면 별도 터미널에서 `ollama serve`를 �
 
 ```sh
 python -m streamlit run src/paper_localizer/web.py
-paper-localizer run "path/to/paper.pdf" -o "outputs/paper.ko.md"
+paper-localizer run "path/to/paper.pdf" -o "outputs/paper.translated.md"
 paper-localizer extract "path/to/paper.pdf" -o "outputs/paper.extracted.md"
 ```
 
@@ -80,14 +82,16 @@ paper-localizer extract "path/to/paper.pdf" -o "outputs/paper.extracted.md"
 ```sh
 paper-localizer extract ".tmp/example/(2008) Bitcoin_ A Peer-to-Peer Electronic Cash System.pdf" -o outputs/bitcoin.extracted.md
 paper-localizer extract ".tmp/example/(2001) Pastry_ Scalable, decentralized object location and routing for large-scale peer-to-peer systems.pdf" -o outputs/pastry.extracted.md
-paper-localizer run ".tmp/example/(2008) Bitcoin_ A Peer-to-Peer Electronic Cash System.pdf" -o outputs/bitcoin.ko.md
+paper-localizer run ".tmp/example/(2008) Bitcoin_ A Peer-to-Peer Electronic Cash System.pdf" -o outputs/bitcoin.translated.md
 ```
 
 그림 분리를 적용한 결과 Bitcoin 논문은 9페이지에서 7개, Pastry 논문은 22페이지에서 10개 그림을 추출했습니다. 전체 번역은 Ollama 설치와 두 모델 다운로드 후 `run` 명령으로 실행합니다.
 
 ## 출력과 중단 후 재개
 
-Markdown 첫 부분에는 목적·방법·주요 결과·한계 요약이 들어갑니다. 이어서 각 청크별 원문과 번역이 함께 정리되며 페이지 번호가 표시됩니다. 처리 도중 중단되면 출력 파일 옆에 `.progress.json` 체크포인트가 남습니다. 같은 PDF와 동일한 모델·설정·출력 경로로 다시 실행하면 완료된 청크를 건너뜁니다. 성공하면 체크포인트를 삭제합니다.
+원본 초록과 생성 요약은 구분해 표시하며, 본문은 청크 보고서 대신 원래 절과 문단 순서로 제공합니다. HTML은 IEEE Xplore의 논문 읽기 구성을 참고해 왼쪽 목차, 제목과 저자 정보, 초록, 본문, 문맥 속 그림과 캡션, 참고문헌을 배치합니다. 헤더는 `PLoTrans`입니다. 번역이 있는 문서는 `Original`, `Translation`, `Parallel view`로 전환할 수 있으며 인쇄용 스타일과 작은 화면용 레이아웃도 포함됩니다. Markdown에는 같은 절 순서와 접을 수 있는 번역 영역을 제공합니다.
+
+처리 도중 중단되면 출력 파일 옆에 `.progress.json` 체크포인트가 남습니다. 같은 PDF와 동일한 모델·설정·출력 경로로 다시 실행하면 완료된 청크를 건너뜁니다. 성공하면 체크포인트를 삭제합니다. HTML은 외부 CDN이나 서버 없이 로컬 파일로 열 수 있습니다.
 
 ## 그림과 글 분리
 
@@ -99,7 +103,11 @@ OpenDataLoader의 텍스트 구조에 더해, 글자 표시 명령만 제거한 
 
 ```text
 outputs/
-  paper.ko.md
+  paper.translated.md
+  paper.translated.html
+  paper.translated.zip
+  assets/
+    article.css
   figs/
     <PDF 해시>/
       page-002-fig-01.png
@@ -107,13 +115,17 @@ outputs/
       page-016-math-003.png
 ```
 
-Markdown은 `![그림 p.2-1](figs/<PDF 해시>/page-002-fig-01.png)`처럼 상대 경로를 참조합니다. 다른 PC로 옮길 때는 Markdown과 `figs/`를 함께 복사하거나 웹 화면의 ZIP을 사용하세요. 웹 미리보기에도 그림이 표시됩니다. 그림 파일 경로는 번역 모델에 보내지 않아 모델이 경로를 변경하지 않습니다.
+Markdown은 `![Fig. p.2-1](figs/<PDF 해시>/page-002-fig-01.png)`처럼 상대 경로를 참조합니다. 다른 PC로 옮길 때는 ZIP을 풀어 폴더 구성을 유지하세요. 웹 화면에도 동일한 HTML 문서를 미리보기로 제공합니다. 그림 파일 경로는 번역 모델에 보내지 않아 모델이 경로를 변경하지 않습니다.
 
 ## 수식 누락 방지
 
 Pastry 논문처럼 문자 대응 정보(ToUnicode)가 없는 Type3 글꼴을 사용하는 PDF는 화면에 수식이 보이더라도 텍스트 추출 결과에서 수식이 빠질 수 있습니다. 이런 수식 글꼴과 별도 수학 글꼴 구간은 원본 PDF에서 작은 PNG로 렌더링해 문장 안에 삽입합니다. 그림과 같은 `figs/<PDF 해시>/` 폴더에 보관되며 ZIP에도 함께 들어갑니다.
 
-예를 들어 Fig.7 캡션의 `b=4`, `|L|=16`, `|M|=32`는 각각 원본 수식 이미지로 보존합니다. 일반 글자는 편집 가능한 텍스트로 유지합니다. 수식만 있는 행을 추출기가 통째로 누락했으면 독립된 수식 원문 블록을 추가하며, 텍스트와의 대응 위치가 불확실하면 해당 원문 구간의 이미지를 함께 제공합니다.
+예를 들어 Fig.7 캡션의 `b=4`, `|L|=16`, `|M|=32`는 원본 수식 이미지로 보존합니다. 문자별 좌표를 사용해 수식 글꼴뿐 아니라 같은 식에 속한 일반 글꼴 숫자, 연산자, 괄호, 함수명과 첨자까지 하나의 이미지로 묶습니다. 따라서 `O(log N)` 같은 식이 일부만 이미지로 나뉘는 현상을 줄입니다.
+
+문장 속 수식은 `<img class="inline-math" ...>` 형태의 인라인 HTML로 삽입합니다. 주변 글자 크기에 대한 `em` 높이와 원본 PDF 기준선으로 수직 정렬을 계산하며, CSS를 제거하는 뷰어에도 작은 크기를 유지하도록 `width`·`height` 속성을 함께 제공합니다. 원문과 번역에 같은 HTML 태그를 복원합니다. HTML을 허용하는 Markdown 뷰어를 사용하세요.
+
+수식만 있는 행을 추출기가 통째로 누락했으면 독립된 수식 이미지를 추가합니다. 대응 위치가 불확실한 구간은 원문 이미지 한 번으로 표시하며, 같은 본문 텍스트를 이미지 옆에 중복 출력하지 않습니다. 그림 영역에 속한 글자도 좌표를 대조해 본문에서 제거합니다.
 
 번역 요청 시에는 인라인 수식을 `[[MATH_0001]]` 같은 표식으로 바꿉니다. 응답에서 각 표식이 정확히 한 번 나타나는지 검사한 뒤 원본 수식 이미지로 복원합니다. 누락·중복이면 한 번 재시도하고, 계속 실패하면 오류를 내어 수식이 사라진 번역을 저장하지 않습니다. 청크 경계에서도 이미지 경로를 쪼개지 않습니다.
 

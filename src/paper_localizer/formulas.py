@@ -119,9 +119,18 @@ _FUNCTIONS = {"O", "log", "ln", "exp", "sin", "cos", "tan", "min", "max", "Pr", 
 
 def _expand_expressions(spans: list[TextSpan]) -> list[TextSpan]:
     """Include readable operators, digits, brackets and identifiers in one crop."""
+    identifiers: set[int] = set()
+    prose = {"and", "or", "is", "where", "with", "for", "the", "a", "an", "if", "then", "else", "return", "while"}
+    for index, span in enumerate(spans):
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", span.text) or span.text.lower() in prose: continue
+        neighbors = spans[max(0, index - 1):index] + spans[index + 1:index + 2]
+        if any(other.text in {"=", "≤", "≥", "+", "*", "/"} for other in neighbors): identifiers.add(span.index)
+        if index + 1 < len(spans) and spans[index + 1].text == "(":
+            gap = spans[index + 1].box[0] - span.box[2]
+            if gap <= max(8, span.font_size) * 0.25: identifiers.add(span.index)
     def candidate(span: TextSpan) -> bool:
         text = span.text
-        return (span.math or text in _FUNCTIONS or text.replace(".", "").isdigit()
+        return (span.math or span.index in identifiers or text in _FUNCTIONS or text.replace(".", "").isdigit()
                 or (len(text) == 1 and text.isalpha())
                 or (text.isalpha() and bool(re.search("Italic|Oblique", span.font_name, re.I)))
                 or all(char in "+-=*/^_()[]{}<>|,:;≤≥≈≠∞·×÷" for char in text))
@@ -234,7 +243,7 @@ def _insertions(content: str, spans: list[TextSpan], groups: list[list[TextSpan]
         end = offsets[after] if after < len(offsets) else len(content)
         removed = content[start:end]
         math_length = sum(len(_canonical(span.text)[0]) for span in group)
-        math_words = set(re.findall(r"[A-Za-z]{3,}", "".join(span.text for span in group).lower()))
+        math_words = set(re.findall(r"[A-Za-z]{3,}", " ".join(span.text for span in group).lower()))
         removed_words = set(re.findall(r"[A-Za-z]{3,}", removed.lower()))
         if len(removed) > max(32, math_length * 2 + 4) or not removed_words.issubset(math_words):
             return None
@@ -242,6 +251,47 @@ def _insertions(content: str, spans: list[TextSpan], groups: list[list[TextSpan]
     if any(a[1] > b[0] for a, b in zip(ranges, ranges[1:])):
         return None
     return ranges
+
+
+def _remove_figure_duplicates(nodes: list[dict], spans: list[TextSpan], figure_boxes: list[Box],
+                              preserve_captions: bool = True) -> int:
+    changed = 0
+    for node in nodes:
+        content = node.get("content", "")
+        box = _box(node)
+        if not content or not box: continue
+        if preserve_captions and re.match(r"^(?:-\s*)?Fig(?:ure)?\.?\s*\d", content, re.I): continue
+        selected = [span for span in spans if _inside(span.box, box)]
+        marked = [replace(span, math=any(
+            figure and _intersection(span.box, figure) / max(_area(span.box), 1) >= 0.7
+            for figure in figure_boxes)) for span in selected]
+        covered = [span for span in marked if span.math]
+        if not covered: continue
+        if len(covered) == len(marked):
+            node["content"] = ""; changed += 1; continue
+        ranges = _insertions(content, marked, _groups(marked))
+        if ranges is None: continue
+        for start, end in reversed(ranges): content = content[:start] + content[end:]
+        content = re.sub(r" {2,}", " ", content).strip()
+        if content != node["content"]:
+            node["content"] = content; changed += 1
+    return changed
+
+
+def _split_mixed_heading(node: dict, spans: list[TextSpan]) -> None:
+    if node.get("type") != "heading" or "<img" in node.get("content", ""): return
+    selected = [span for span in spans if _inside(span.box, _box(node))]
+    if not selected or not re.search("Bold|Black", selected[0].font_name, re.I): return
+    title = []
+    for span in selected:
+        if not re.search("Bold|Black", span.font_name, re.I) and not span.math:
+            if span.baseline < selected[0].baseline - max(3, selected[0].font_size * 0.4): break
+        title.append(span.text)
+    else: return
+    prefix = _canonical("".join(title))[0]
+    content, offsets = _canonical(node["content"])
+    if prefix and content.startswith(prefix) and len(content) - len(prefix) > 10:
+        node["heading split"] = offsets[len(prefix) - 1] + 1
 
 
 def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
@@ -263,21 +313,33 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 width, height = page.get_size()
                 spans = _spans(page)
                 figure_boxes = [_box(f) for f in figures if f["page number"] == page_number]
+                nodes = by_page.get(page_number, [])
+                document["deduplicated figure text"] = document.get("deduplicated figure text", 0) + _remove_figure_duplicates(
+                    nodes, spans, figure_boxes)
                 spans = [span for span in spans if not any(
                     box and _intersection(span.box, box) / max(_area(span.box), 1) > 0.7 for box in figure_boxes
                 )]
                 assignments: dict[int, list[TextSpan]] = defaultdict(list)
                 unassigned: list[TextSpan] = []
-                nodes = by_page.get(page_number, [])
+                nodes = [node for node in nodes if node.get("content", "").strip()]
                 for group in _groups(spans):
                     group_box = _group_box(group)
-                    candidates = [(index, _area(_box(node))) for index, node in enumerate(nodes)
-                                  if _intersection(group_box, _box(node)) / max(_area(group_box), 1) >= 0.75]
+                    candidates = []
+                    for index, node in enumerate(nodes):
+                        box = _box(node)
+                        padded = (box[0] - 2.5, box[1] - 2.5, box[2] + 2.5, box[3] + 2.5)
+                        if (_intersection(group_box, box) / max(_area(group_box), 1) >= 0.75
+                                or _intersection(group_box, padded) / max(_area(group_box), 1) >= 0.95):
+                            candidates.append((index, _area(box)))
                     if candidates:
                         index = min(candidates, key=lambda item: item[1])[0]
                         assignments[index].extend(group)
                     else:
                         unassigned.extend(group)
+                unassigned_ids = {span.index for span in unassigned}
+                orphan_groups = _groups([s for s in spans if not s.math or s.index in unassigned_ids])
+                document["deduplicated equation text"] = document.get("deduplicated equation text", 0) + _remove_figure_duplicates(
+                    nodes, spans, [_group_box(group) for group in orphan_groups], preserve_captions=False)
                 counter = 0
 
                 def save(box: Box, *, block: bool = False, metrics: tuple[float, float] | None = None) -> str:
@@ -295,7 +357,7 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     reference = destination.relative_to(output_dir).as_posix()
                     formulas.append({"source": reference, "page number": page_number,
                                      "bounding box": [left, bottom, right, top], "block": block})
-                    alt = f"수식-p{page_number}-{counter}"
+                    alt = f"Eq.-p{page_number}-{counter}"
                     if block:
                         return f"![{alt}]({reference})"
                     font_size, baseline = metrics or (9, bottom + 1.5)
@@ -307,6 +369,9 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     node = nodes[index]
                     node_box = _box(node)
                     assigned_ids = {s.index for s in assigned}
+                    if not node.get("content", "").strip():
+                        orphan_groups.extend(_groups([s for s in spans if not s.math or s.index in assigned_ids]))
+                        continue
                     selected = [s for s in spans if _inside(s.box, node_box) or s.index in assigned_ids]
                     # Keep normal anchors and only the formulas owned by this node.
                     selected = [s for s in selected if not s.math or s.index in assigned_ids]
@@ -329,8 +394,7 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                         content = content[:start] + image + content[end:]
                     node["content"] = content
                 # Display equations that the layout parser dropped entirely.
-                unassigned_ids = {span.index for span in unassigned}
-                for group in _groups([s for s in spans if not s.math or s.index in unassigned_ids]):
+                for group in orphan_groups:
                     box = _group_box(group)
                     image = save(box, block=True)
                     equation = {"type": "formula", "page number": page_number,
@@ -346,6 +410,8 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                             insertion = index
                             break
                     document.setdefault("kids", []).insert(insertion, equation)
+                for node in nodes:
+                    _split_mixed_heading(node, spans)
             finally:
                 page.close()
     document["formulas"] = formulas

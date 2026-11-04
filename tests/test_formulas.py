@@ -8,7 +8,7 @@ from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
 
 from paper_localizer.bundle import FIGURE_LINK, build_bundle, inline_equation_preview
 from paper_localizer.core import ProcessingError, _split_text, _translate_chunk, extract_blocks
-from paper_localizer.formulas import recover_formulas
+from paper_localizer.formulas import TextSpan, _remove_figure_duplicates, recover_formulas
 from paper_localizer.markup import image_reference, inline_image_tag
 from io import BytesIO
 from zipfile import ZipFile
@@ -45,7 +45,7 @@ def math_fixture(path: Path) -> dict:
         b"BT /F1 12 Tf 30 180 Td (Fig.7. Quality of routing tables, ) Tj "
         b"/M0 12 Tf <01> Tj /F1 12 Tf (, and 5,000 nodes.) Tj ET "
         b"BT /F1 12 Tf 30 130 Td (Normal prose with a legacy\002soft hyphen stays editable.) Tj ET "
-        b"BT /F1 12 Tf 30 100 Td (Complexity is O\\(log ) Tj /M0 12 Tf <02> Tj "
+        b"BT /F1 12 Tf 30 100 Td (Complexity is Cost\\(log ) Tj /M0 12 Tf <02> Tj "
         b"/F1 12 Tf (\\) + 1.) Tj ET "
         b"BT /M0 16 Tf 80 60 Td <01> Tj ET"
     )
@@ -58,11 +58,29 @@ def math_fixture(path: Path) -> dict:
         {"type": "paragraph", "page number": 1, "bounding box": [30, 126, 500, 144],
          "content": "Normal prose with a legacy soft hyphen stays editable."},
         {"type": "paragraph", "page number": 1, "bounding box": [30, 96, 500, 114],
-         "content": "Complexity is O(log ) + 1."},
+         "content": "Complexity is Cost(log ) + 1."},
     ]}
 
 
 class FormulaTests(unittest.TestCase):
+    def test_embedded_figure_labels_are_removed_without_removing_neighboring_prose(self):
+        spans = [TextSpan(0, "Before prose.", (0, 60, 40, 70), False, 10, 60),
+                 TextSpan(1, "Input", (10, 30, 30, 40), False, 10, 30),
+                 TextSpan(2, "Output", (40, 30, 60, 40), False, 10, 30),
+                 TextSpan(3, "After prose.", (0, 0, 40, 10), False, 10, 0)]
+        node = {"type": "paragraph", "content": "Before prose. Input Output After prose.",
+                "bounding box": [0, 0, 80, 80]}
+        _remove_figure_duplicates([node], spans, [(0, 20, 80, 50)])
+        self.assertEqual(node["content"], "Before prose. After prose.")
+
+    def test_uncertain_source_snapshot_is_not_also_emitted_as_duplicate_text(self):
+        snapshot = "![Source block](figs/paper/page-001-math-001.png)"
+        document = {"kids": [{"type": "paragraph", "page number": 1,
+                               "content": "Incomplete equation and text.", "formula snapshot": snapshot}]}
+        blocks = extract_blocks(document)
+        self.assertEqual([block.text for block in blocks], [snapshot])
+        self.assertEqual(blocks[0].kind, "formula")
+
     def test_missing_inline_and_displayed_type3_equations_are_preserved(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory); source = root / "formula.pdf"

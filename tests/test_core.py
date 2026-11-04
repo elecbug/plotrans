@@ -61,7 +61,7 @@ class CoreTests(unittest.TestCase):
             client = FakeClient()
             process_pdf(source, output, parser=lambda path: DOCUMENT, client=client)
             markdown = output.read_text(encoding="utf-8")
-            self.assertIn("## 논문 요약", markdown)
+            self.assertIn("## Article summary", markdown)
             self.assertIn("The method improved accuracy.", markdown)
             self.assertIn("번역된 내용", markdown)
             self.assertIn("p.1, 2", markdown)

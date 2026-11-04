@@ -13,14 +13,14 @@ from paper_localizer.bundle import standalone_html
 
 
 def main() -> None:
-    st.set_page_config(page_title="논문 로컬 번역기", page_icon="📄", layout="wide")
-    st.title("논문 로컬 번역기")
+    st.set_page_config(page_title="PLoTrans", page_icon="📄", layout="wide")
+    st.title("PLoTrans")
     st.caption("PDF 논문을 원문·번역이 함께 있는 Markdown과 HTML로 정리합니다.")
     uploaded = st.file_uploader("논문 PDF 선택", type="pdf")
     with st.expander("설정", expanded=False):
         translation_model = st.text_input("번역 모델", TRANSLATION_MODEL)
         summary_model = st.text_input("요약 모델", SUMMARY_MODEL)
-        target_language = st.text_input("번역 언어", "Korean")
+        target_language = st.text_input("번역 언어", "English")
         ollama_url = st.text_input("Ollama 주소", OLLAMA_URL)
         chunk_size = st.slider("청크 크기 (문자)", 500, 3500, 1800, 100)
     if st.button("분석 및 번역", disabled=uploaded is None, type="primary") and uploaded:
@@ -32,7 +32,7 @@ def main() -> None:
         with tempfile.TemporaryDirectory(prefix="paper-localizer-upload-") as directory:
             source = Path(directory) / Path(uploaded.name).name
             source.write_bytes(uploaded.getvalue())
-            destination = Path("outputs") / f"{source.stem}.ko.md"
+            destination = Path("outputs") / f"{source.stem}.translated.md"
             try:
                 result = process_pdf(
                     source, destination, translation_model=translation_model,

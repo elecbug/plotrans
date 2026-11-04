@@ -309,7 +309,7 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                         "type": "image", "page number": page_number,
                         "bounding box": [left, height - bottom, right, height - top],
                         "source": destination.relative_to(output_dir).as_posix(),
-                        "alt": f"그림 p.{page_number}-{figure_index}",
+                        "alt": f"Fig. p.{page_number}-{figure_index}",
                     })
             finally:
                 page.close(); graphics_page.close()
