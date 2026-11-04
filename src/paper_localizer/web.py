@@ -10,6 +10,7 @@ import streamlit as st
 from paper_localizer.core import (OLLAMA_URL, SUMMARY_MODEL, TRANSLATION_MODEL,
                                   ProcessingError, process_pdf)
 from paper_localizer.bundle import FIGURE_LINK, build_bundle, figure_path, inline_equation_preview
+from paper_localizer.markup import image_reference
 
 
 def main() -> None:
@@ -59,11 +60,12 @@ def main() -> None:
             markdown = inline_equation_preview(Path(st.session_state["result_path"]), markdown)
             cursor = 0
             for match in FIGURE_LINK.finditer(markdown):
-                st.markdown(markdown[cursor:match.start()])
-                image_path = figure_path(Path(st.session_state["result_path"]), match.group(2))
-                st.image(str(image_path), caption=match.group(1))
+                st.markdown(markdown[cursor:match.start()], unsafe_allow_html=True)
+                reference = image_reference(match)
+                image_path = figure_path(Path(st.session_state["result_path"]), reference.source)
+                st.image(str(image_path), caption=reference.alt)
                 cursor = match.end()
-            st.markdown(markdown[cursor:])
+            st.markdown(markdown[cursor:], unsafe_allow_html=True)
 
 
 if __name__ == "__main__":

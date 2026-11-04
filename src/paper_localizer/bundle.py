@@ -2,12 +2,12 @@
 
 from io import BytesIO
 import base64
+from html import escape
 from pathlib import Path
-import re
 from zipfile import ZIP_DEFLATED, ZipFile
 
+from .markup import FIGURE_LINK, image_reference, inline_image_tag
 
-FIGURE_LINK = re.compile(r"!\[([^\]\n]*)\]\((figs/[A-Za-z0-9_./-]+)\)")
 
 
 def figure_path(markdown_path: Path, reference: str) -> Path:
@@ -21,7 +21,7 @@ def figure_path(markdown_path: Path, reference: str) -> Path:
 def build_bundle(markdown_path: Path) -> bytes:
     markdown = markdown_path.read_text(encoding="utf-8")
     stream = BytesIO()
-    references = {match.group(2) for match in FIGURE_LINK.finditer(markdown)}
+    references = {image_reference(match).source for match in FIGURE_LINK.finditer(markdown)}
     with ZipFile(stream, "w", ZIP_DEFLATED) as archive:
         archive.writestr(markdown_path.name, markdown.encode("utf-8"))
         for reference in sorted(references):
@@ -30,10 +30,22 @@ def build_bundle(markdown_path: Path) -> bytes:
 
 
 def inline_equation_preview(markdown_path: Path, markdown: str) -> str:
-    """Keep equation PNGs inline in Streamlit's Markdown preview."""
-    def replace(match: re.Match) -> str:
-        if "-math-" not in match.group(2):
-            return match.group(0)
-        encoded = base64.b64encode(figure_path(markdown_path, match.group(2)).read_bytes()).decode("ascii")
-        return f"![{match.group(1)}](data:image/png;base64,{encoded})"
-    return FIGURE_LINK.sub(replace, markdown)
+    """Render trusted image tags inline and escape all other source HTML."""
+    parts: list[str] = []
+    cursor = 0
+    for match in FIGURE_LINK.finditer(markdown):
+        parts.append(escape(markdown[cursor:match.start()], quote=False))
+        reference = image_reference(match)
+        if reference.inline or "-math-" in reference.source:
+            encoded = base64.b64encode(figure_path(markdown_path, reference.source).read_bytes()).decode("ascii")
+            source = f"data:image/png;base64,{encoded}"
+            if reference.inline:
+                parts.append(inline_image_tag(source, reference.alt, reference.height_em,
+                                              reference.align_em, reference.aspect_ratio))
+            else:
+                parts.append(f"![{escape(reference.alt)}]({source})")
+        else:
+            parts.append(f"![{escape(reference.alt)}]({reference.source})")
+        cursor = match.end()
+    parts.append(escape(markdown[cursor:], quote=False))
+    return "".join(parts)

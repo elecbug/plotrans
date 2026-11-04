@@ -120,7 +120,7 @@ def extract_blocks(document: dict) -> list[Block]:
 
 
 def _split_text(text: str, limit: int) -> list[str]:
-    if len(text) <= limit:
+    if len(FIGURE_LINK.sub("[[MATH_0001]]", text)) <= limit:
         return [text]
     parts: list[str] = []
     remaining = text
@@ -160,11 +160,12 @@ def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
             chunks.append(Chunk(len(chunks) + 1, (block.page,), block.text, kind))
             continue
         for part in _split_text(block.text, limit):
-            if size + len(part) + 2 > limit:
+            part_size = len(FIGURE_LINK.sub("[[MATH_0001]]", part))
+            if size + part_size + 2 > limit:
                 flush()
             lines.append(part)
             pages.add(block.page)
-            size += len(part) + 2
+            size += part_size + 2
     flush()
     return chunks
 

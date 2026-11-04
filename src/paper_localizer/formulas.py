@@ -6,6 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 import hashlib
+import math
 from pathlib import Path
 import re
 import unicodedata
@@ -13,6 +14,7 @@ import unicodedata
 import pypdfium2 as pdfium
 
 from .figures import _PDFIUM_LOCK, _area, _intersection, _nodes, _union
+from .markup import inline_image_tag
 
 
 _MATH_FONT = re.compile(r"(?:CMMI|CMSY|CMEX|MSAM|MSBM|Symbol|Math)", re.I)
@@ -25,6 +27,8 @@ class TextSpan:
     text: str
     box: Box
     math: bool
+    font_size: float
+    baseline: float
 
 
 def _canonical(text: str) -> tuple[str, list[int]]:
@@ -58,11 +62,13 @@ def _spans(page) -> list[TextSpan]:
             text = obj.extract()
             font = obj.get_font().get_base_name()
             box = tuple(obj.get_bounds())
+            matrix = obj.get_matrix()
+            effective_size = obj.get_font_size() * math.hypot(matrix.c, matrix.d)
             # Legacy prose fonts can contain soft-hyphen control codes too.
             # They must not turn an entire normal text line into an equation.
             undecodable = not font or bool(_MATH_FONT.search(font))
             if text.strip() and _area(box):
-                result.append(TextSpan(index, text, box, undecodable))
+                result.append(TextSpan(index, text, box, undecodable, effective_size, matrix.f))
     finally:
         textpage.close()
     return result
@@ -94,6 +100,22 @@ def _group_box(group: list[TextSpan]) -> Box:
     for span in group[1:]:
         box = _union(box, span.box)
     return box
+
+
+def _inline_metrics(group: list[TextSpan], spans: list[TextSpan], node: dict) -> tuple[float, float]:
+    box = _group_box(group)
+    node_font = float(node.get("font size") or 9)
+    if node_font < 2:
+        node_font = 9
+    anchors = [span for span in spans if not span.math and span.font_size >= 2
+               and box[1] - node_font * 1.5 <= span.baseline <= box[3] + node_font]
+    if anchors:
+        def distance(span: TextSpan) -> float:
+            horizontal = max(box[0] - span.box[2], span.box[0] - box[2], 0)
+            return horizontal + abs(span.baseline - group[0].baseline) * 2
+        anchor = min(anchors, key=distance)
+        return anchor.font_size, anchor.baseline
+    return node_font, group[0].baseline
 
 
 def _insertions(content: str, spans: list[TextSpan], groups: list[list[TextSpan]]) -> list[tuple[int, int]] | None:
@@ -174,7 +196,7 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                         unassigned.append(span)
                 counter = 0
 
-                def save(box: Box, *, block: bool = False) -> str:
+                def save(box: Box, *, block: bool = False, metrics: tuple[float, float] | None = None) -> str:
                     nonlocal counter
                     counter += 1
                     left, bottom, right, top = box
@@ -183,11 +205,19 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     destination = asset_dir / f"page-{page_number:03d}-math-{counter:03d}.png"
                     asset_dir.mkdir(parents=True, exist_ok=True)
                     bitmap = page.render(scale=2, crop=(left, bottom, width - right, height - top), draw_annots=False)
-                    image = bitmap.to_pil(); image.save(destination); image.close(); bitmap.close()
+                    image = bitmap.to_pil()
+                    aspect = image.width / image.height
+                    image.save(destination); image.close(); bitmap.close()
                     reference = destination.relative_to(output_dir).as_posix()
                     formulas.append({"source": reference, "page number": page_number,
                                      "bounding box": [left, bottom, right, top], "block": block})
-                    return f"![수식-p{page_number}-{counter}]({reference})"
+                    alt = f"수식-p{page_number}-{counter}"
+                    if block:
+                        return f"![{alt}]({reference})"
+                    font_size, baseline = metrics or (9, bottom + 1.5)
+                    height_em = (top - bottom) / font_size
+                    align_em = (bottom - baseline) / font_size
+                    return inline_image_tag(reference, alt, height_em, align_em, aspect)
 
                 for index, assigned in assignments.items():
                     node = nodes[index]
@@ -205,7 +235,7 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                         node["formula snapshot"] = snapshot
                         continue
                     content = node["content"]
-                    edits = [(start, end, save(_group_box(group)))
+                    edits = [(start, end, save(_group_box(group), metrics=_inline_metrics(group, selected, node)))
                              for (start, end), group in zip(ranges, groups, strict=True)]
                     for start, end, image in reversed(edits):
                         if end < len(content) and content[end].isalnum():

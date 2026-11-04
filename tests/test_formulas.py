@@ -6,9 +6,12 @@ from pypdf import PdfWriter
 from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
                            FloatObject, NameObject, NumberObject)
 
-from paper_localizer.bundle import FIGURE_LINK, inline_equation_preview
+from paper_localizer.bundle import FIGURE_LINK, build_bundle, inline_equation_preview
 from paper_localizer.core import ProcessingError, _split_text, _translate_chunk, extract_blocks
 from paper_localizer.formulas import recover_formulas
+from paper_localizer.markup import image_reference, inline_image_tag
+from io import BytesIO
+from zipfile import ZipFile
 
 
 def math_fixture(path: Path) -> dict:
@@ -59,14 +62,30 @@ class FormulaTests(unittest.TestCase):
             document = recover_formulas(source, math_fixture(source), root)
             self.assertEqual(len(document["formulas"]), 2)
             caption = next(n for n in document["kids"] if n.get("type") == "caption")["content"]
-            self.assertRegex(caption, r"tables, !\[.*?\]\(figs/.*?\), and 5,000 nodes\.")
+            self.assertRegex(caption, r'tables, <img\b[^>]+/>, and 5,000 nodes\.')
+            reference = image_reference(next(FIGURE_LINK.finditer(caption)))
+            self.assertTrue(reference.inline)
+            self.assertGreater(reference.height_em, 0.3)
+            self.assertLess(reference.height_em, 3)
+            self.assertIn("vertical-align:", caption)
             self.assertTrue(all((root / f["source"]).is_file() for f in document["formulas"]))
             self.assertIn("Normal prose with a legacy soft hyphen stays editable.",
                           [b.text for b in extract_blocks(document)])
             self.assertTrue(any(b.kind == "formula" for b in extract_blocks(document)))
             preview = inline_equation_preview(root / "paper.md", caption)
             self.assertIn("data:image/png;base64,", preview)
-            self.assertNotIn("(figs/", preview)
+            self.assertNotIn('src="figs/', preview)
+            self.assertIn("inline-block", preview)
+            markdown = root / "paper.md"
+            markdown.write_text(caption + "\n\n" + next(
+                n["content"] for n in document["kids"] if n.get("formula image")), encoding="utf-8")
+            with ZipFile(BytesIO(build_bundle(markdown))) as archive:
+                self.assertEqual(len(archive.namelist()), 3)
+            unsafe = caption.replace('class="inline-math"', 'onerror="alert(1)" class="inline-math"')
+            safe = inline_equation_preview(markdown, "<script>alert(1)</script>" + unsafe)
+            self.assertNotIn("<script>", safe)
+            self.assertNotIn("onerror", safe)
+            self.assertIn("&lt;script&gt;", safe)
 
     def test_translation_retries_then_restores_equation_without_exposing_path(self):
         class Client:
@@ -92,6 +111,17 @@ class FormulaTests(unittest.TestCase):
         source = "word " * 34 + image + " sentence " * 30
         parts = _split_text(source, 200)
         self.assertEqual(sum(len(FIGURE_LINK.findall(part)) for part in parts), 1)
+
+    def test_html_equations_keep_their_positions_and_attributes_in_translation(self):
+        class Client:
+            def chat(self, *args, **kwargs): return "앞 [[MATH_0001]], 중간 [[MATH_0002]] 뒤."
+        first = inline_image_tag("figs/paper/first.png", "첫 수식", 1.2, -0.2, 2)
+        second = inline_image_tag("figs/paper/second.png", "두 번째 수식", 0.9, 0.1, 3)
+        source = f"before {first}, middle {second} after."
+        result = _translate_chunk(Client(), "translate", source, "Korean")
+        self.assertEqual(result, f"앞 {first}, 중간 {second} 뒤.")
+        # HTML attributes must not force a short sentence into separate chunks.
+        self.assertEqual(_split_text(source, 200), [source])
 
 
 if __name__ == "__main__": unittest.main()
