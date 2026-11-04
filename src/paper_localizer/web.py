@@ -9,7 +9,7 @@ import streamlit as st
 
 from paper_localizer.core import (OLLAMA_URL, SUMMARY_MODEL, TRANSLATION_MODEL,
                                   ProcessingError, process_pdf)
-from paper_localizer.bundle import FIGURE_LINK, build_bundle, figure_path
+from paper_localizer.bundle import FIGURE_LINK, build_bundle, figure_path, inline_equation_preview
 
 
 def main() -> None:
@@ -56,6 +56,7 @@ def main() -> None:
                            file_name=st.session_state["filename"], mime="text/markdown")
         with st.expander("결과 미리보기"):
             markdown = st.session_state["markdown"].decode("utf-8")
+            markdown = inline_equation_preview(Path(st.session_state["result_path"]), markdown)
             cursor = 0
             for match in FIGURE_LINK.finditer(markdown):
                 st.markdown(markdown[cursor:match.start()])

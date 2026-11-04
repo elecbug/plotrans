@@ -1,6 +1,7 @@
 """Portable Markdown exports with their referenced figure files."""
 
 from io import BytesIO
+import base64
 from pathlib import Path
 import re
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -26,3 +27,13 @@ def build_bundle(markdown_path: Path) -> bytes:
         for reference in sorted(references):
             archive.write(figure_path(markdown_path, reference), reference)
     return stream.getvalue()
+
+
+def inline_equation_preview(markdown_path: Path, markdown: str) -> str:
+    """Keep equation PNGs inline in Streamlit's Markdown preview."""
+    def replace(match: re.Match) -> str:
+        if "-math-" not in match.group(2):
+            return match.group(0)
+        encoded = base64.b64encode(figure_path(markdown_path, match.group(2)).read_bytes()).decode("ascii")
+        return f"![{match.group(1)}](data:image/png;base64,{encoded})"
+    return FIGURE_LINK.sub(replace, markdown)
