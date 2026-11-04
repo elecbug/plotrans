@@ -48,7 +48,7 @@ def doctor(url: str, translation_model: str, summary_model: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="논문 PDF를 로컬에서 요약·번역합니다.")
     sub = parser.add_subparsers(dest="command", required=True)
-    run = sub.add_parser("run", help="PDF를 Markdown으로 변환")
+    run = sub.add_parser("run", help="PDF를 Markdown·HTML 논문 패키지로 변환")
     run.add_argument("pdf", type=Path)
     run.add_argument("-o", "--output", type=Path)
     run.add_argument("--translation-model", default=TRANSLATION_MODEL)
@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "extract":
             output = args.output or Path("outputs") / f"{args.pdf.stem}.extracted.md"
             path = extract_pdf(args.pdf, output, chunk_size=args.chunk_size)
-            print(f"추출 완료: {path.resolve()}")
+            print(f"추출 완료: {path.resolve()}\nHTML: {path.with_suffix('.html').resolve()}\nZIP: {path.with_suffix('.zip').resolve()}")
             return 0
         output = args.output or Path("outputs") / f"{args.pdf.stem}.ko.md"
         path = process_pdf(
@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> int:
             chunk_size=args.chunk_size, ollama_url=args.ollama_url,
             progress=lambda stage, index, total: print(f"{stage}: {index}/{total}", flush=True),
         )
-        print(f"완료: {path.resolve()}")
+        print(f"완료: {path.resolve()}\nHTML: {path.with_suffix('.html').resolve()}\nZIP: {path.with_suffix('.zip').resolve()}")
         return 0
     except (ProcessingError, ValueError) as exc:
         print(f"오류: {exc}", file=sys.stderr)

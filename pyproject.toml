@@ -12,6 +12,8 @@ dependencies = [
     "pypdf==6.10.0",
     "pypdfium2==5.14.0",
     "Pillow==12.3.0",
+    "markdown-it-py==4.0.0",
+    "mdurl==0.1.2",
 ]
 
 [project.optional-dependencies]
@@ -22,3 +24,6 @@ paper-localizer = "paper_localizer.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+paper_localizer = ["assets/*.css"]

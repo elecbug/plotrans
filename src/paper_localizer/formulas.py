@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 import hashlib
+import ctypes
 import math
 from pathlib import Path
 import re
@@ -29,6 +30,7 @@ class TextSpan:
     math: bool
     font_size: float
     baseline: float
+    font_name: str = ""
 
 
 def _canonical(text: str) -> tuple[str, list[int]]:
@@ -57,21 +59,104 @@ def _inside(span: Box, node: Box, padding: float = 2.5) -> bool:
 def _spans(page) -> list[TextSpan]:
     textpage = page.get_textpage()
     result: list[TextSpan] = []
+    fonts: dict[int, tuple[str, float, float, bool]] = {}
+    pending: list[TextSpan] = []
+    category = ""
+
+    def flush() -> None:
+        nonlocal pending, category
+        if pending:
+            first = pending[0]
+            text = "".join(span.text for span in pending)
+            box = first.box
+            for span in pending[1:]: box = _union(box, span.box)
+            seed = any(span.math for span in pending) or text in {"=", "+", "≤", "≥", "∑", "∫", "√", "±", "×"}
+            seed = seed or (len(text) == 1 and text.isalpha() and bool(re.search("Italic|Oblique", first.font_name, re.I)))
+            result.append(TextSpan(first.index, text, box, seed, max(s.font_size for s in pending),
+                                   first.baseline, first.font_name))
+        pending, category = [], ""
+
     try:
-        for index, obj in enumerate(page.get_objects(filter=[pdfium.raw.FPDF_PAGEOBJ_TEXT], textpage=textpage)):
-            text = obj.extract()
-            font = obj.get_font().get_base_name()
-            box = tuple(obj.get_bounds())
-            matrix = obj.get_matrix()
-            effective_size = obj.get_font_size() * math.hypot(matrix.c, matrix.d)
-            # Legacy prose fonts can contain soft-hyphen control codes too.
-            # They must not turn an entire normal text line into an equation.
-            undecodable = not font or bool(_MATH_FONT.search(font))
-            if text.strip() and _area(box):
-                result.append(TextSpan(index, text, box, undecodable, effective_size, matrix.f))
+        count = textpage.count_chars()
+        for index in range(count):
+            code = pdfium.raw.FPDFText_GetUnicode(textpage, index)
+            text = chr(code) if 0 < code <= 0x10FFFF else "\ufffd"
+            obj = textpage.get_textobj(index)
+            if obj is None:
+                if text.isspace(): flush()
+                continue
+            key = ctypes.cast(obj.raw, ctypes.c_void_p).value
+            if key not in fonts:
+                font = obj.get_font().get_base_name()
+                matrix = obj.get_matrix()
+                size = obj.get_font_size() * math.hypot(matrix.c, matrix.d)
+                fonts[key] = font, size, matrix.f, not font or bool(_MATH_FONT.search(font))
+            font, size, baseline, undecodable = fonts[key]
+            if text.isspace() and not undecodable:
+                flush(); continue
+            if not text.isprintable() and not undecodable: continue
+            box = tuple(textpage.get_charbox(index))
+            if not _area(box): continue
+            if text.isspace(): text = "\ufffd"
+            kind = "word" if text.isalpha() else "number" if text.isdigit() else text
+            decimal = text == "." and category == "number" and index + 1 < count and chr(
+                pdfium.raw.FPDFText_GetUnicode(textpage, index + 1)).isdigit()
+            if decimal: kind = "number"
+            reference_size = max(8, size)
+            separated = pending and (abs(baseline - pending[-1].baseline) > reference_size * 0.5
+                                      or box[0] - pending[-1].box[2] > reference_size * 0.5)
+            if category != kind or kind not in {"word", "number"} or separated: flush()
+            category = kind
+            pending.append(TextSpan(index, text, box, undecodable, size, baseline, font))
+        flush()
     finally:
         textpage.close()
-    return result
+    return _expand_expressions(result)
+
+
+_FUNCTIONS = {"O", "log", "ln", "exp", "sin", "cos", "tan", "min", "max", "Pr", "lim", "det", "mod", "arg"}
+
+
+def _expand_expressions(spans: list[TextSpan]) -> list[TextSpan]:
+    """Include readable operators, digits, brackets and identifiers in one crop."""
+    def candidate(span: TextSpan) -> bool:
+        text = span.text
+        return (span.math or text in _FUNCTIONS or text.replace(".", "").isdigit()
+                or (len(text) == 1 and text.isalpha())
+                or (text.isalpha() and bool(re.search("Italic|Oblique", span.font_name, re.I)))
+                or all(char in "+-=*/^_()[]{}<>|,:;≤≥≈≠∞·×÷" for char in text))
+
+    def connected(a: TextSpan, b: TextSpan) -> bool:
+        size = max(8, min(max(a.font_size, b.font_size), 24))
+        gap_x = max(b.box[0] - a.box[2], a.box[0] - b.box[2], 0)
+        gap_y = max(b.box[1] - a.box[3], a.box[1] - b.box[3], 0)
+        if gap_x > size * 0.75 or gap_y > size * 0.7: return False
+        if (a.text.isalpha() and b.text.isalpha() and a.text not in _FUNCTIONS and b.text not in _FUNCTIONS
+                and not (a.math and b.math) and gap_x > size * 0.18): return False
+        return True
+
+    selected: set[int] = set()
+    for seed, span in enumerate(spans):
+        if not span.math: continue
+        left = right = seed
+        while left and candidate(spans[left - 1]) and connected(spans[left - 1], spans[left]): left -= 1
+        while right + 1 < len(spans) and candidate(spans[right + 1]) and connected(spans[right], spans[right + 1]): right += 1
+        # Commas separate expressions unless they are inside function arguments.
+        stack: list[str] = []
+        start = left
+        for index in range(left, right + 2):
+            text = spans[index].text if index <= right else ";"
+            if text in {"(", "[", "{"}: stack.append(text)
+            elif text in {")", "]", "}"}:
+                if stack: stack.pop()
+                else:
+                    if start <= seed < index: selected.update(range(start, index))
+                    start = index + 1
+            if text in {",", ";", ":"} and not stack:
+                if start <= seed < index: selected.update(range(start, index))
+                start = index + 1
+        if start <= seed <= right: selected.update(range(start, right + 1))
+    return [replace(span, math=True) if index in selected else span for index, span in enumerate(spans)]
 
 
 def _groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
@@ -85,7 +170,7 @@ def _groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
             previous = groups[-1][-1]
             gap_x = max(span.box[0] - previous.box[2], previous.box[0] - span.box[2], 0)
             gap_y = max(span.box[1] - previous.box[3], previous.box[1] - span.box[3], 0)
-            if gap_x <= 30 and gap_y <= 8:
+            if gap_x <= 30 and gap_y <= max(8, min(max(span.font_size, previous.font_size), 18) * 1.4):
                 groups[-1].append(span)
             else:
                 groups.append([span])
@@ -184,16 +269,15 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 assignments: dict[int, list[TextSpan]] = defaultdict(list)
                 unassigned: list[TextSpan] = []
                 nodes = by_page.get(page_number, [])
-                for span in spans:
-                    if not span.math:
-                        continue
+                for group in _groups(spans):
+                    group_box = _group_box(group)
                     candidates = [(index, _area(_box(node))) for index, node in enumerate(nodes)
-                                  if _inside(span.box, _box(node))]
+                                  if _intersection(group_box, _box(node)) / max(_area(group_box), 1) >= 0.75]
                     if candidates:
                         index = min(candidates, key=lambda item: item[1])[0]
-                        assignments[index].append(span)
+                        assignments[index].extend(group)
                     else:
-                        unassigned.append(span)
+                        unassigned.extend(group)
                 counter = 0
 
                 def save(box: Box, *, block: bool = False, metrics: tuple[float, float] | None = None) -> str:
@@ -222,8 +306,8 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 for index, assigned in assignments.items():
                     node = nodes[index]
                     node_box = _box(node)
-                    selected = [s for s in spans if _inside(s.box, node_box)]
                     assigned_ids = {s.index for s in assigned}
+                    selected = [s for s in spans if _inside(s.box, node_box) or s.index in assigned_ids]
                     # Keep normal anchors and only the formulas owned by this node.
                     selected = [s for s in selected if not s.math or s.index in assigned_ids]
                     groups = _groups(selected)
@@ -231,7 +315,9 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     if ranges is None:
                         # Preserve uncertain alignment as a complete source snapshot
                         # rather than insert an equation into an unrelated sentence.
-                        snapshot = save(node_box, block=True)
+                        whole_box = node_box
+                        for group in groups: whole_box = _union(whole_box, _group_box(group))
+                        snapshot = save(whole_box, block=True)
                         node["formula snapshot"] = snapshot
                         continue
                     content = node["content"]

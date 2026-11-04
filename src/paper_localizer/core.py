@@ -17,6 +17,7 @@ from typing import Callable
 from .figures import attach_figures
 from .formulas import recover_formulas
 from .bundle import FIGURE_LINK
+from .article import build_article, article_markdown, write_article
 
 
 TRANSLATION_MODEL = "kaelri/hy-mt2:7b-q4_K_M"
@@ -154,6 +155,8 @@ def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
         lines, pages, size = [], set(), 0
 
     for block in blocks:
+        if block.kind == "heading" or re.match(r"^(?:Abstract|초록)\s*[.:：]", block.text, re.I):
+            flush()
         if block.kind in {"image", "formula"}:
             flush()
             kind = "figure" if block.kind == "image" else "formula"
@@ -325,29 +328,9 @@ def _document_title(document: dict, fallback: str) -> str:
 def render_markdown(document: dict, pdf_name: str, chunks: list[Chunk],
                     translations: list[str], summary: str, translation_model: str,
                     summary_model: str, language: str) -> str:
-    title = _document_title(document, pdf_name)
-    lines = [
-        f"# {title}", "", f"- 원본 파일: `{pdf_name}`",
-        f"- 페이지: {document.get('number of pages', '?')}",
-        f"- 번역 언어: {language}", f"- 번역 모델: `{translation_model}`",
-        f"- 요약 모델: `{summary_model}`", "", "## 논문 요약", "", summary, "",
-        "## 원문과 번역", "",
-    ]
-    for chunk, translated in zip(chunks, translations, strict=True):
-        page_label = ", ".join(map(str, chunk.pages))
-        if chunk.kind in {"figure", "formula"}:
-            label = "그림" if chunk.kind == "figure" else "수식 원문"
-            lines.extend([f"### {label} · p.{page_label}", "", chunk.source, ""])
-            continue
-        lines.extend([
-            f"### 청크 {chunk.index} · p.{page_label}", "", "**원문**", "",
-            chunk.source, "", f"**{language} 번역**", "", translated, "",
-        ])
-    lines.extend([
-        "---", "", "원문은 OpenDataLoader PDF가 추출한 텍스트입니다. "
-        "수식·그림·스캔 페이지 및 번역 정확도는 원본 PDF와 대조해 주세요.", "",
-    ])
-    return "\n".join(lines)
+    article = build_article(document, _document_title(document, pdf_name), pdf_name,
+                            chunks, translations, summary, language)
+    return article_markdown(article)
 
 
 def extract_pdf(pdf_path: Path, output_path: Path, *, chunk_size: int = 1800) -> Path:
@@ -361,15 +344,8 @@ def extract_pdf(pdf_path: Path, output_path: Path, *, chunk_size: int = 1800) ->
     chunks = make_chunks(extract_blocks(document), chunk_size)
     if not chunks:
         raise ProcessingError("추출한 본문 텍스트가 없습니다. 스캔 PDF라면 OCR 처리가 필요합니다.")
-    title = _document_title(document, pdf_path.name)
-    lines = [f"# {title}", "", f"원본: `{pdf_path.name}`", "", "## 추출 원문", ""]
-    for chunk in chunks:
-        pages = ", ".join(map(str, chunk.pages))
-        label = {"figure": "그림", "formula": "수식 원문"}.get(chunk.kind, f"청크 {chunk.index}")
-        lines.extend([f"### {label} · p.{pages}", "", chunk.source, ""])
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text("\n".join(lines), encoding="utf-8")
-    return output_path
+    return write_article(document, _document_title(document, pdf_path.name), pdf_path.name,
+                         chunks, None, "", "Korean", output_path)
 
 
 def process_pdf(pdf_path: Path, output_path: Path, *,
@@ -445,11 +421,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
     if progress:
         progress("전체 요약", len(chunks), len(chunks))
     summary = _combine_summary(notes, client, summary_model, target_language)
-    markdown = render_markdown(document, pdf_path.name, chunks, translations, summary,
-                               translation_model, summary_model, target_language)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
-    temp_path.write_text(markdown, encoding="utf-8")
-    temp_path.replace(output_path)
+    write_article(document, _document_title(document, pdf_path.name), pdf_path.name,
+                  chunks, translations, summary, target_language, output_path)
     checkpoint.unlink(missing_ok=True)
     return output_path
