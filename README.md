@@ -36,6 +36,16 @@ Download the result with **Download paper ZIP**, or find the files in `outputs/`
 
 The Docker setup uses Ollama `0.40.14` and a Python `3.12` image. A GPU is optional, but the 7B translation model requires substantial memory and processing time. Adjust Docker's memory limit for your environment. Model downloads are unnecessary when only extracting with the default OCR settings.
 
+Python dependencies are installed before copying `src/`, and BuildKit keeps downloaded packages in a cache mount. Source-only builds reuse the dependency layer. Installation skips bytecode compilation to reduce the new layer's size. The first build still has to export the large OCR dependencies; check `exporting layers` separately from installation when inspecting build timings.
+
+For repeated source edits, use the development override:
+
+```sh
+docker compose -f docker-compose.yaml -f docker-compose.dev.yaml up --build -d
+```
+
+This mounts `src/` read-only, imports the mounted package through `PYTHONPATH`, and enables Streamlit's file polling. Further Python and UI edits do not require an image rebuild. Rebuild when `pyproject.toml` or the Dockerfile changes. The standard Compose configuration continues to use the source packaged in its image.
+
 ## Option 2: Local installation
 
 1. Install Python 3.11 or later and Java 11 or later. Check `python --version` and `java -version`. On Windows, open a new PowerShell session after changing PATH.

@@ -1,0 +1,8 @@
+services:
+  app:
+    environment:
+      PYTHONPATH: /app/src
+      PYTHONDONTWRITEBYTECODE: "1"
+      STREAMLIT_SERVER_FILE_WATCHER_TYPE: poll
+    volumes:
+      - ./src:/app/src:ro
