@@ -8,7 +8,7 @@ import re
 from .figures import _nodes, _union
 
 
-CAPTION = re.compile(r"^(?:[-•■▪‣]\s*)?(Fig(?:ure)?\.?|Table)\s*((?:[A-Z]\.)?\d+(?:\.\d+)*)([.:]\s*|\s+)", re.I)
+CAPTION = re.compile(r"^(?:[-•■▪‣]\s*)?(Fig(?:ure)?\.?|Table)\s*((?:[A-Z]\.)?\d+(?:\.\d+)*|[IVXLCDM]+)([.:]\s*|\s+)", re.I)
 _REFERENCE_VERBS = re.compile(r"^(?:shows?|illustrates?|depicts?|presents?|plots?|evaluates?|is|are|provides?|compares?|summarizes?)\b", re.I)
 
 
@@ -114,10 +114,12 @@ def caption_for_region(region, captions, height, nodes):
         left, bottom, right, top = caption["bounding box"]
         is_table = label.startswith("Table ")
         gap = region[1] - (height - bottom) if is_table else height - top - region[3]
+        table_below = is_table and -4 <= height-top-region[3] <= 24
+        if table_below: gap = height-top-region[3]
         overlap = min(right, region[2]) - max(left, region[0])
         if not (-4 <= gap <= (120 if is_table else 420)) or overlap < min(right-left, region[2]-region[0]) * .55:
             continue
-        between_bottom, between_top = ((height-region[1], bottom) if is_table else (top, height-region[3]))
+        between_bottom, between_top = ((height-region[1], bottom) if is_table and not table_below else (top, height-region[3]))
         blocked = False
         for node in nodes:
             if node is caption or node.get("type") == "caption" or not node.get("content"):

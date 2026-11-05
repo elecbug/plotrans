@@ -9,7 +9,8 @@ import xml.etree.ElementTree as ET
 from latex2mathml.converter import convert
 
 
-LATEX = re.compile(r"(?<!\\)\$\$([\s\S]+?)\$\$|(?<!\\)\$(?!\$)([^$\n]+?)\$(?!\$)|\\\(([\s\S]+?)\\\)|\\\[([\s\S]+?)\\\]")
+_CURRENCY = r"\s*\d[\d,.]*(?:[kKmMbBtT])?\s*(?i:USD|EUR|GBP|CAD|AUD|dollars?|million|billion)\b"
+LATEX = re.compile(r"(?<!\\)\$\$([\s\S]+?)\$\$|(?<!\\)\$(?!\$)(?!" + _CURRENCY + r")([^$\n]+?)\$(?!\$)|\\\(([\s\S]+?)\\\)|\\\[([\s\S]+?)\\\]")
 _TAGS = set("math mrow mi mo mn mtext mspace mfrac mroot msqrt msup msub msubsup mover munder munderover mtable mtr mtd mlabeledtr mfenced menclose mstyle mpadded mphantom none mmultiscripts mprescripts semantics annotation".split())
 _ATTRS = set("display mathvariant stretchy fence separator lspace rspace accent accentunder movablelimits largeop columnalign rowalign columnspacing rowspacing columnlines rowlines frame framespacing equalrows equalcolumns align rowspan columnspan notation width height depth voffset linethickness bevelled scriptlevel displaystyle encoding".split())
 ET.register_namespace("", "http://www.w3.org/1998/Math/MathML")
@@ -34,7 +35,10 @@ def mathml(latex: str, display: bool = False) -> str:
         if node.tag.rsplit("}", 1)[-1] not in _TAGS:
             raise ValueError("Unsupported MathML element")
         node.attrib = {key: value for key, value in node.attrib.items() if key in _ATTRS}
-    return ET.tostring(root, encoding="unicode")
+    rendered = ET.tostring(root, encoding="unicode")
+    # Markdown exports can be opened by other CommonMark renderers. Encode
+    # operator characters that would otherwise start emphasis inside MathML.
+    return rendered.replace(">*<", ">&#42;<").replace(">_<", ">&#95;<")
 
 
 def valid_math(text: str) -> bool:

@@ -41,6 +41,7 @@ class Block:
     caption_target: str = ""
     source_pages: tuple[int, ...] = ()
     paragraph_id: str = ""
+    table_data: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class Chunk:
     kind: str = "text"
     caption_target: str = ""
     paragraph_ids: tuple[str, ...] = ()
+    source_parts: tuple[str, ...] = ()
+    table_data: dict | None = None
 
 
 def _descendant_text(node: dict) -> str:
@@ -68,6 +71,25 @@ def _descendant_text(node: dict) -> str:
 
 
 def _table_markdown(node: dict) -> str:
+    from .tables import TableError, table_grid
+    native = _native_table_rows(node)
+    try:
+        grid = table_grid(native)
+    except TableError:
+        grid = ()
+    if grid:
+        header_rows = max((i + cell["rowspan"] for i, row in enumerate(native[:3])
+                           for cell in row if cell["header"]), default=1)
+        header_rows = min(header_rows, len(grid) - 1) if len(grid) > 1 else 1
+        headers = []
+        for column in range(len(grid[0])):
+            labels = list(dict.fromkeys(grid[row][column] for row in range(header_rows) if grid[row][column]))
+            headers.append(" / ".join(labels))
+        rows = [headers] + [list(row) for row in grid[header_rows:]]
+        escaped = [[re.sub(r"\s+", " ", cell).replace("|", "\\|") for cell in row] for row in rows]
+        lines = ["| " + " | ".join(row) + " |" for row in escaped]
+        lines.insert(1, "| " + " | ".join(["---"] * len(headers)) + " |")
+        return "\n".join(lines)
     rows: list[list[str]] = []
     for row in node.get("rows", []):
         cells = sorted(row.get("cells", []), key=lambda c: c.get("column number", 0))
@@ -80,6 +102,17 @@ def _table_markdown(node: dict) -> str:
     lines = ["| " + " | ".join(row + [""] * (width - len(row))) + " |" for row in rows]
     lines.insert(1, "| " + " | ".join(["---"] * width) + " |")
     return "\n".join(lines)
+
+
+def _native_table_rows(node: dict) -> list[list[dict]]:
+    rows = []
+    for row in sorted(node.get("rows", []), key=lambda value: value.get("row number", 0)):
+        rows.append([{"text": _descendant_text(cell),
+                      "rowspan": max(1, int(cell.get("row span", 1))),
+                      "colspan": max(1, int(cell.get("column span", 1))),
+                      "header": bool(cell.get("is_header") or cell.get("pdfua_tag") == "TH")}
+                     for cell in sorted(row.get("cells", []), key=lambda value: value.get("column number", 0))])
+    return rows
 
 
 def extract_blocks(document: dict) -> list[Block]:
@@ -122,10 +155,18 @@ def extract_blocks(document: dict) -> list[Block]:
         if kind == "table":
             table = _table_markdown(node)
             if table:
-                blocks.append(Block(page, kind, table))
+                from .tables import TableError, table_grid
+                rows = _native_table_rows(node)
+                try:
+                    table_grid(rows)
+                    data = {"rows": rows}
+                except TableError:
+                    data = None
+                blocks.append(Block(page, kind, table, table_data=data))
             return
         if snapshot := node.get("formula snapshot"):
-            blocks.append(Block(page, "caption-image" if kind == "caption" else "formula", snapshot))
+            snapshot_kind = {"caption": "caption-image", "abstract": "abstract-image"}.get(kind, "formula")
+            blocks.append(Block(page, snapshot_kind, snapshot))
             return
         content = node.get("content")
         if isinstance(content, str) and content.strip():
@@ -208,22 +249,24 @@ def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
         nonlocal lines, paragraph_ids, pages, size
         if lines:
             chunks.append(Chunk(len(chunks) + 1, tuple(sorted(pages)), "\n\n".join(lines),
-                                paragraph_ids=tuple(paragraph_ids)))
+                                paragraph_ids=tuple(paragraph_ids), source_parts=tuple(lines)))
         lines, paragraph_ids, pages, size = [], [], set(), 0
 
     for block_number, block in enumerate(blocks, 1):
         paragraph_id = block.paragraph_id or f"block-{block_number}"
         if block.kind == "heading" or re.match(r"^(?:Abstract|초록)\s*[.:：]", block.text, re.I):
             flush()
-        if block.kind in {"image", "table-image", "portrait", "formula", "caption", "caption-image", "code", "frontmatter", "keywords"}:
+        if block.kind in {"image", "table", "table-image", "portrait", "formula", "caption", "caption-image", "code", "frontmatter", "keywords", "abstract", "abstract-image"}:
             flush()
             kind = "figure" if block.kind == "image" else block.kind
-            chunks.append(Chunk(len(chunks) + 1, (block.page,), block.text, kind, block.caption_target))
+            chunks.append(Chunk(len(chunks) + 1, (block.page,), block.text, kind, block.caption_target,
+                                table_data=block.table_data))
             continue
         if len(block.source_pages) > 1:
             flush()
             for part in _split_text(block.text, limit):
-                chunks.append(Chunk(len(chunks)+1, block.source_pages, part, paragraph_ids=(paragraph_id,)))
+                chunks.append(Chunk(len(chunks)+1, block.source_pages, part,
+                                    paragraph_ids=(paragraph_id,), source_parts=(part,)))
             continue
         for part in _split_text(block.text, limit):
             part_size = len(LATEX.sub("[[MATH_0001]]", FIGURE_LINK.sub("[[MATH_0001]]", part)))
@@ -512,7 +555,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
             continue
         if progress:
             progress("Translating and summarizing", index, len(chunks))
-        if chunk.kind in {"figure", "table-image", "portrait", "formula", "caption-image", "code", "frontmatter"}:
+        if chunk.kind in {"figure", "table-image", "portrait", "formula", "caption-image", "abstract-image", "code", "frontmatter"}:
             translations.append(chunk.source)
             from .markup import image_reference
             equations = [document.get("math transcriptions", {}).get(image_reference(match).source)

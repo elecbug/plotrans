@@ -65,6 +65,9 @@ def native_expression(page, box) -> str | None:
             # Object handles can repeat across characters; do not retain them.
             name = obj.get_font().get_base_name()
             if not name: return None
+            # Some legacy embedded math fonts advertise a Unicode map while
+            # mapping operators to unrelated Latin characters (e.g. = to ¼).
+            if re.search(r"AdvP4C4E", name, re.I): return None
             matrix = obj.get_matrix()
             size = obj.get_font_size() * math.hypot(matrix.c, matrix.d)
             if not size or size <= 0: return None

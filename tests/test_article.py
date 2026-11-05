@@ -6,9 +6,9 @@ from zipfile import ZipFile
 
 from PIL import Image
 
-from paper_localizer.article import article_html, build_article, write_article
+from paper_localizer.article import article_html, build_article, write_article, _md_html
 from paper_localizer.bundle import FIGURE_LINK, standalone_html
-from paper_localizer.core import Chunk
+from paper_localizer.core import Block, Chunk, make_chunks
 from paper_localizer.markup import image_reference, inline_image_tag
 
 
@@ -24,6 +24,41 @@ class Audit(HTMLParser):
 
 
 class ArticleTests(unittest.TestCase):
+    def test_embedded_ocr_paragraphs_preserve_chunk_ownership(self):
+        blocks = [Block(1, "heading", "## Body"),
+                  Block(1, "paragraph", "First paragraph.\n\nSecond paragraph.", paragraph_id="original"),
+                  Block(1, "paragraph", "Another source block.", paragraph_id="next")]
+        article = build_article({}, "Paper", "paper.pdf", make_chunks(blocks))
+        self.assertEqual([u.paragraph_id for u in article.sections[0].units], ["original", "next"])
+        self.assertIn("Second paragraph.", article.sections[0].units[0].source)
+
+    def test_legacy_chunks_with_extra_blank_lines_do_not_lose_text(self):
+        chunks = [Chunk(1, (1,), "## Body\n\nFirst.\n\nSecond.", paragraph_ids=("one", "two"))]
+        article = build_article({}, "Paper", "paper.pdf", chunks)
+        self.assertEqual([u.source for u in article.sections[0].units], ["First.", "Second."])
+
+    def test_starred_math_cannot_open_markdown_emphasis_across_equations(self):
+        import xml.etree.ElementTree as ET
+        html = _md_html(r"Call $N^{*}$ for some set $N^{*}$, then retain the following text.")
+        self.assertNotIn("<em>", html)
+        root = ET.fromstring(html.strip())
+        self.assertEqual(len(root.findall(".//{http://www.w3.org/1998/Math/MathML}math")), 2)
+        self.assertIn("retain the following text.", "".join(root.itertext()))
+
+    def test_currency_amounts_do_not_turn_intervening_prose_into_math(self):
+        html = _md_html("FileCoin is $1.4B USD. Eth2.0 has a market cap of $143B USD.")
+        self.assertNotIn("<math", html)
+        self.assertIn("$1.4B USD", html)
+        self.assertIn("market cap of $143B USD", html)
+
+    def test_math_like_url_remains_an_attribute_without_html_injection(self):
+        html=_md_html('[source](https://example.org/$x$) with $y^2$.')
+        self.assertIn('href="https://example.org/$x$"', html)
+        self.assertEqual(html.count('<math '), 1)
+        import xml.etree.ElementTree as ET
+        root=ET.fromstring(html.strip())
+        self.assertEqual(root.find('a').attrib['href'], 'https://example.org/$x$')
+
     def test_graphics_reserve_their_source_aspect_ratio_before_lazy_loading(self):
         document = {"figures": [
             {"source": "figs/paper/plot.png", "pixel size": [1200, 600]},

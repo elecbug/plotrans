@@ -2,22 +2,22 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 import re
 from statistics import median
 
 import pypdfium2 as pdfium
 
-from .figures import _PDFIUM_LOCK, _union
+from .figures import _PDFIUM_LOCK, _union, _nodes
 from .formulas import _canonical, _inside, _spans
 from .markup import FIGURE_LINK
 from .source_links import restore_printed_targets, source_printed_target
 
 
-_NUMBERED_TITLE = re.compile(r"^(?:[IVXLCDM]+\.\s+|[A-Z]\.\s+|\d+\)\s+)\S")
+_NUMBERED_TITLE = re.compile(r"^(?:[IVXLCDM]+\.\s+|[A-Z]\.\s+|\d+(?:\.\d+)*[.)]?\s+)\S")
 _LIST_MARKER = re.compile(r"^(?:[-•▪‣◦]\s+|\d+[.)]\s+|[a-z]\)\s+|\[\d+\]\s+)")
-_ABSTRACT = re.compile(r"^abstract\b", re.I)
+_ABSTRACT = re.compile(r"^(?:abstract\b|a\s+b\s+s\s+t\s+r\s+a\s+c\s+t\b)", re.I)
 _KEYWORDS = re.compile(r"^(?:index terms|keywords)\b", re.I)
 
 
@@ -64,16 +64,22 @@ def _line_text(line) -> str:
     return re.sub(r"\s*-\s*", "-", text)
 
 
-def _is_title(text: str) -> bool:
+def _is_title(text: str, font_name: str = "") -> bool:
     letters = "".join(char for char in text if char.isalpha())
-    return bool(letters and letters.isupper() and (
-        _NUMBERED_TITLE.match(text) or text in {"REFERENCES", "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS"}))
+    capitals = bool(letters and letters.isupper() and (
+        _NUMBERED_TITLE.match(text) or re.sub(r"\s+", "", text) in {"REFERENCES", "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS"}))
+    mixed = bool(re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z]", text)
+                 and re.search(r"Bold|Medi|Semibold|TB$", font_name, re.I)
+                 and len(text.split()) <= 15 and not text.endswith((".", ";")))
+    return capitals or mixed
 
 
 def _heading_level(text: str, font_name: str = "") -> int:
-    if text == "REFERENCES": return 2
+    if re.sub(r"\s+", "", text) in {"REFERENCES", "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS"}: return 2
     if re.match(r"^[IVXLCDM]+\.\s", text) and not re.search(r"Italic|Oblique|It$", font_name, re.I): return 2
     if re.match(r"^[A-Z]\.\s", text): return 3
+    if re.match(r"^\d+(?:\.\d+)+\s", text): return 3
+    if re.match(r"^\d+[.)]?\s", text): return 2
     return 4
 
 
@@ -91,16 +97,25 @@ def _split_titles(node: dict, spans) -> list[dict]:
     lines = _source_lines(node, spans)
     if lines:
         node["source first line indent"] = lines[0][0].box[0] - node["bounding box"][0]
-    if not lines or not _is_title(_line_text(lines[0])):
-        return [node]
+    if not lines: return [node]
+    if not _is_title(_line_text(lines[0]), lines[0][0].font_name):
+        source_key = _canonical(text)[0]
+        start = next((i for i,line in enumerate(lines)
+                      if _is_title(_line_text(line), line[0].font_name)
+                      and source_key.startswith(_canonical(_line_text(line))[0])), None)
+        if start is None: return [node]
+        # Layout bounds can include the tail of the preceding paragraph. That
+        # neighboring line is not part of a source-matched heading's content.
+        lines = lines[start:]
     source, offsets = _canonical(text)
     cursor, line_at, result = 0, 0, []
-    while line_at < len(lines) and _is_title(_line_text(lines[line_at])):
+    while line_at < len(lines) and _is_title(_line_text(lines[line_at]), lines[line_at][0].font_name):
         first, end = line_at, line_at + 1
         while end < len(lines):
             candidate = _line_text(lines[end])
             letters = "".join(c for c in candidate if c.isalpha())
-            if not letters.isupper() or _NUMBERED_TITLE.match(candidate): break
+            if _NUMBERED_TITLE.match(candidate): break
+            if not letters.isupper() and not re.search(r"Bold|Medi|Semibold|TB$", lines[first][0].font_name, re.I): break
             if lines[end][0].font_name != lines[first][0].font_name: break
             end += 1
         title = " ".join(_line_text(line) for line in lines[first:end])
@@ -110,7 +125,8 @@ def _split_titles(node: dict, spans) -> list[dict]:
         start_at = offsets[cursor]
         cursor += len(key)
         end_at = offsets[cursor - 1] + 1
-        item = dict(node, type="heading", content=text[start_at:end_at].strip(),
+        heading_text = re.sub(r"^(\d+(?:\.\d+)*)(?=[A-Z])", r"\1 ", text[start_at:end_at].strip())
+        item = dict(node, type="heading", content=heading_text,
                     **{"heading level": _heading_level(title, lines[first][0].font_name),
                        "bounding box": _line_box(lines[first:end])})
         item.pop("heading split", None)
@@ -131,10 +147,54 @@ def _split_titles(node: dict, spans) -> list[dict]:
 
 def _front_matter(document: dict) -> None:
     nodes = [n for n in document["kids"] if n.get("page number") == 1 and n.get("content")]
+    width, height = document["page sizes"]["1"]
+    for node in nodes:
+        box = node.get("bounding box")
+        if box and box[2]-box[0] < width*.08 and box[3]-box[1] > height*.25:
+            node["type"] = "frontmatter"
+            node.pop("heading level", None)
     abstract = next((n for n in nodes if _ABSTRACT.match(n["content"])), None)
-    title = next((n for n in nodes if n.get("type") == "heading" and n.get("heading level") == 1), None)
-    if not abstract or not title: return
+    introduction = next((n for n in nodes if re.match(r"^(?:1\s*\.?\s*|I\.\s*)Introduction\b", n["content"], re.I)), None)
+    if not abstract and not introduction: return
+    title_key = re.sub(r"\W", "", str(document.get("title") or "")).casefold()
+    candidates = [n for n in nodes if n.get("bounding box") and len(n["content"]) > 20
+                  and n["bounding box"][2]-n["bounding box"][0] > width*.4
+                  and not _ABSTRACT.match(n["content"])
+                  and (not abstract or n["bounding box"][1] > abstract["bounding box"][3])]
+    title = next((n for n in candidates if title_key and re.sub(r"\W", "", n["content"]).casefold() == title_key), None)
+    if title is None:
+        title = max(candidates, key=lambda n: float(n.get("font size") or 0), default=None)
+    if title is None: return
+    title["type"], title["heading level"] = "heading", 1
+    if not title_key or str(document.get("title", "")).lower().endswith((".dvi", ".ps", ".pdf")):
+        document["title"] = title["content"]
+    if not abstract and introduction:
+        intro_top = introduction["bounding box"][3]
+        prose = [n for n in nodes if n.get("bounding box") and n is not title
+                 and n["bounding box"][1] > intro_top and n["bounding box"][3] < title["bounding box"][1]
+                 and len(n["content"].split()) >= 45
+                 and not re.match(r"CCS Concepts|Additional Key|ACM Reference|Authors.? addresses", n["content"], re.I)]
+        abstract = max(prose, key=lambda n: n["bounding box"][3], default=None)
+    if not abstract: return
     abstract_top = abstract["bounding box"][3]
+    abstract_box = abstract["bounding box"]
+    boundaries = [n["bounding box"][3] for n in nodes if n.get("bounding box") and n is not abstract
+                  and (n.get("type") == "heading" or _KEYWORDS.match(n["content"])
+                       or re.match(r"CCS Concepts|Additional Key|ACM Reference", n["content"], re.I))
+                  and n["bounding box"][3] < abstract_top
+                  and n["bounding box"][0] < abstract_box[2]+10 and n["bounding box"][2] > abstract_box[0]-10]
+    abstract_bottom = max(boundaries, default=height*.2)
+    for node in nodes:
+        box = node.get("bounding box")
+        if not box or node is title: continue
+        aligned = abs(box[0]-abstract_box[0]) < 15
+        if (node is abstract or aligned and box[3] <= abstract_top+2 and box[1] > abstract_bottom
+                and node.get("type") not in {"frontmatter", "footer", "header"}
+                and not _KEYWORDS.match(node["content"])
+                and not re.match(r"CCS Concepts|Additional Key|ACM Reference", node["content"], re.I)):
+            node["type"] = "abstract"
+            node["content"] = _ABSTRACT.sub("", node["content"], count=1).lstrip(" :.—-\n")
+            node.pop("heading level", None)
     title_bottom = title["bounding box"][1]
     authors = []
     for node in nodes:
@@ -151,13 +211,17 @@ def _front_matter(document: dict) -> None:
     if not document.get("author") and authors:
         document["author"] = " ".join(authors)
     document["title bounds"] = title["bounding box"]
-    height = document["page sizes"]["1"][1]
     sizes = [n["font size"] for n in nodes if n.get("font size") and n.get("type") == "paragraph"
              and n.get("bounding box", [0, 0, 0, 0])[3] <= abstract_top]
     body_size = median(sizes) if sizes else 10
     for node in nodes:
         box = node.get("bounding box")
-        if not box or box[3] > height * .12: continue
+        if not box or node.get("type") in {"abstract", "heading", "caption", "table"}: continue
+        if re.match(r"^(?:[-•■▪‣]\s*)?(?:Fig(?:ure)?\.?|Table)\s*(?:\d|[IVXLCDM]+\b)|^\[\d+\]\s", node["content"], re.I): continue
+        if (box[3] < height*.30 and float(node.get("font size") or body_size) < body_size*.94
+                and len(node["content"].split()) > 4):
+            node["type"] = "footnote"
+        if box[3] > height * .12: continue
         text = node["content"]
         if re.fullmatch(r"\d{1,8}", text.strip()) or re.fullmatch(r"VOLUME\s+\d+,?\s+\d{4}", text.strip(), re.I):
             node["type"] = "footer"
@@ -176,11 +240,137 @@ def _restore_source_spacing(node: dict, textpage) -> bool:
         native = native[:-1] + "-"
     native = native.replace("\ufffe", "").replace("\x02", "")
     if any(not char.isprintable() and not char.isspace() for char in native): return False
-    if not native or _canonical(native)[0] != _canonical(text)[0]: return False
+    if not native: return False
+    source_key, text_key = _canonical(native)[0], _canonical(text)[0]
+    if source_key != text_key:
+        pattern = "".join("[–—−-]?" if char in "–—−-" and 0 < i < len(source_key)-1
+                          and source_key[i-1].isdigit() and source_key[i+1].isdigit()
+                          else re.escape(char) for i,char in enumerate(source_key))
+        if not re.fullmatch(pattern, text_key): return False
+    native = re.sub(r"(?<=\d)([–—−-])\s+(?=\d)", r"\1", native)
     native = " ".join(native.split())
     if native == text: return False
     node["content"] = native
     return True
+
+
+def _repair_table_cells(table: dict, textpage) -> None:
+    """Redistribute source-confirmed header text into its actual cell boxes."""
+    cells = [cell for row in table.get("rows", []) for cell in row.get("cells", [])]
+    if not cells or any(not cell.get("bounding box") for cell in cells): return
+    old = [" ".join(n.get("content", "") for n in _nodes(cell) if n.get("content")) for cell in cells]
+    native = [" ".join(textpage.get_text_bounded(*cell["bounding box"]).split()) for cell in cells]
+    if any("\ufffd" in text or any(not char.isprintable() for char in text) for text in native): return
+    if Counter(_canonical("".join(old))[0]) != Counter(_canonical("".join(native))[0]): return
+    if old == native: return
+    for cell, text in zip(cells, native):
+        template = next((n for n in _nodes(cell) if n.get("content")), {})
+        cell["kids"] = [dict(template, type="paragraph", content=text,
+                             **{"bounding box": cell["bounding box"], "page number": table["page number"]})] if text else []
+    table["source cell text repaired"] = True
+
+
+def _mark_page_furniture(document: dict) -> None:
+    groups = defaultdict(list)
+    total_pages = len(document.get("page sizes", {}))
+    for node in document["kids"]:
+        text = node.get("content", "").strip()
+        box = node.get("bounding box");page = node.get("page number", 1)
+        if not box or not re.fullmatch(r"\d{1,12}", text) or node.get("type") in {"caption", "table"}: continue
+        width, height = document["page sizes"].get(str(page), [612, 792])
+        side = "bottom" if box[3] < height*.08 else "top" if box[1] > height*.92 else ""
+        if not side: continue
+        key = side, round((box[0]+box[2])/2/width*40), round(box[1]/height*50)
+        groups[key].append((page, text, node))
+    minimum = max(3, (total_pages+3)//4)
+    furniture = []
+    for group in groups.values():
+        if len({page for page, _, _ in group}) < minimum: continue
+        patterns = defaultdict(list)
+        for page, text, node in group:
+            patterns["plain", int(text)-page].append(node)
+            marker = str(page)
+            if text.endswith(marker) and len(text) > len(marker):
+                patterns["suffix", int(text[:-len(marker)])-page].append(node)
+            if text.startswith(marker) and len(text) > len(marker):
+                patterns["prefix", int(text[len(marker):])-page].append(node)
+        for pattern, candidates in patterns.items():
+            if len({n["page number"] for n in candidates}) < minimum: continue
+            for node in candidates:
+                if node.get("type") == "footer" or node.get("type") == "header": continue
+                node["type"] = "footer" if group[0][2]["bounding box"][3] < document["page sizes"][str(group[0][0])][1]*.08 else "header"
+                node["page furniture reason"] = "sequential page label in a repeated margin position"
+                furniture.append({"page": node["page number"], "text": node["content"], "box": node["bounding box"]})
+    document["page furniture"] = furniture
+    recovered_margins = defaultdict(list)
+    for node in document["kids"]:
+        if not node.get("source text recovered"): continue
+        box = node["bounding box"];page = node["page number"]
+        width, height = document["page sizes"][str(page)]
+        side = "footer" if box[3] < height*.09 else "header" if box[1] > height*.91 else ""
+        if not side or box[3]-box[1] > height*.08: continue
+        words = re.findall(r"[a-z]{3,}", node["content"].lower())
+        key = side, round(box[1]/height*50), tuple(words[-12:])
+        recovered_margins[key].append(node)
+    for (side, _, words), candidates in recovered_margins.items():
+        if len(words) < 6 or len({n["page number"] for n in candidates}) < minimum: continue
+        for node in candidates:
+            node["type"] = side
+            node["page furniture reason"] = "repeated native text in the same outer margin"
+            furniture.append({"page": node["page number"], "text": node["content"], "box": node["bounding box"]})
+
+
+def _recover_uncovered_prose(nodes: list[dict], spans, textpage, width, height, page_number) -> list[dict]:
+    """Recover complete native prose lines omitted by the layout extractor."""
+    boxes = [n["bounding box"] for n in nodes if n.get("bounding box")]
+    lines = []
+    for span in sorted(spans, key=lambda s: (-s.baseline, s.box[0])):
+        line = next((line for line in reversed(lines[-4:])
+                     if abs(line[0].baseline-span.baseline) < 1.5
+                     and -2 <= span.box[0]-line[-1].box[2] < max(25, span.font_size*3)), None)
+        if line is None: lines.append([span])
+        else: line.append(span)
+    missing = []
+    for line in lines:
+        box = _line_box([line])
+        if box[1] < height*.025 or box[3] > height*.98: continue
+        if any(s.math for s in line): continue
+        if any(any(_inside(s.box, b, padding=.8) for b in boxes) for s in line): continue
+        text = " ".join(textpage.get_text_bounded(*[box[0]-.2,box[1]-.2,box[2]+.2,box[3]+.2]).split())
+        if not text or "\ufffd" in text: continue
+        if re.fullmatch(r"[\d\W]+", text): continue
+        missing.append((box, text, line))
+    recovered, group = [], []
+    def flush():
+        if not group: return
+        text = " ".join(item[1] for item in group)
+        if len(re.findall(r"\b[A-Za-z]{2,}\b", text)) < 7: return
+        if not re.search(r"[.!?,;:]", text): return
+        box = _line_box([s for _,_,s in group])
+        recovered.append({"type": "paragraph", "content": text, "bounding box": box,
+                          "page number": page_number, "font": group[0][2][0].font_name,
+                          "font size": group[0][2][0].font_size, "source text recovered": True})
+    for item in missing:
+        if group and (abs(item[0][0]-group[-1][0][0]) > 20
+                      or group[-1][0][1]-item[0][3] > max(22, item[2][0].font_size*2.3)):
+            flush();group=[]
+        group.append(item)
+    flush()
+    return recovered
+
+
+def _join_drop_caps(nodes: list[dict]) -> None:
+    for cap in nodes:
+        text, box = cap.get("content", ""), cap.get("bounding box")
+        if cap.get("type") != "heading" or not re.fullmatch(r"[A-Z]", text) or not box: continue
+        following = next((n for n in nodes if n is not cap and n.get("bounding box")
+                          and 0 <= n["bounding box"][0]-box[2] <= 4
+                          and abs(n["bounding box"][3]-box[3]) < 4
+                          and re.match(r"^[A-Z]{2,}[- ]", n.get("content", ""))), None)
+        if following:
+            following["content"] = text+following["content"]
+            following["bounding box"] = list(_union(box, following["bounding box"]))
+            cap["suppressed"] = True
 
 
 def repair_structure(pdf_path: Path, document: dict) -> dict:
@@ -204,7 +394,13 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
                         for link in links:
                             if printed := source_printed_target(native_page, link.get("url")):
                                 link.setdefault("printed targets", {})[str(page_number)] = printed
-                    for node in by_page.get(page_number, []):
+                    page_nodes = by_page.get(page_number, [])
+                    _join_drop_caps(page_nodes)
+                    if spans:
+                        page_nodes.extend(_recover_uncovered_prose(page_nodes, spans, textpage, *page.get_size(), page_number))
+                    for node in page_nodes:
+                        if node.get("type") == "table":
+                            _repair_table_cells(node, textpage)
                         if spans and not node.get("suppressed") and _restore_source_spacing(node, textpage):
                             spacing_repairs.append({"page": page_number, "bounding box": node["bounding box"]})
                         if spans and not node.get("suppressed") and node.get("content") and node.get("bounding box"):
@@ -227,6 +423,9 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
     document["page sizes"] = sizes
     document["source spacing repairs"] = spacing_repairs
     document["source link text repairs"] = link_repairs
+    document["source text recoveries"] = [{"page": n["page number"], "text": n["content"], "box": n["bounding box"]}
+                                          for n in repaired if n.get("source text recovered")]
+    _mark_page_furniture(document)
     for node in repaired:
         if node.get("type") in {"paragraph", "list item"}:
             node["source paragraph text"] = node.get("content", "")
@@ -240,7 +439,7 @@ def _page_order(nodes: list[dict], width: float) -> list[dict]:
                                             n.get("bounding box", [0, 0, 0, 0])[0]))
 
     textual = [n for n in nodes if n.get("content") and not n.get("suppressed")
-               and n.get("type") not in {"caption", "header", "footer"}
+               and n.get("type") not in {"caption", "header", "footer", "frontmatter", "abstract", "keywords", "footnote"}
                and (box := n.get("bounding box")) and width * .18 < box[2] - box[0] < width * .6]
     lefts = sorted({round(n["bounding box"][0], 1) for n in textual})
     gaps = [(b - a, a, b) for a, b in zip(lefts, lefts[1:])]

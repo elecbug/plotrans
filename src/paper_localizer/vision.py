@@ -10,6 +10,7 @@ from io import BytesIO
 import json
 from pathlib import Path
 import re
+import unicodedata
 import urllib.error
 import urllib.request
 
@@ -103,6 +104,18 @@ def _prose_consistent(first: str, second: str) -> bool:
     key = lambda text: _math_key(text).replace("$", "").lower()
     return (SequenceMatcher(None, key(first), key(second), autojunk=False).ratio() >= .985
             and Counter(re.findall(r"\d+(?:\.\d+)?", first)) == Counter(re.findall(r"\d+(?:\.\d+)?", second)))
+
+
+def _native_prose_preserved(original: str, candidate: str) -> bool:
+    """Two agreeing OCR responses cannot override readable native prose."""
+    def words(text):
+        text = unicodedata.normalize("NFKC", text).lower()
+        text = re.sub(r"(?<=[a-z])-\s+(?=[a-z])", "", text)
+        text = re.sub(r"\\[a-z]+", " ", text)
+        return re.findall(r"\b[a-z]{3,}\b", text)
+    before, after = words(original), words(candidate)
+    numbers = lambda text: Counter(re.findall(r"\d+(?:\.\d+)?", text))
+    return bool(before) and before == after and numbers(original) == numbers(candidate)
 
 
 def _formula_signature(path: Path):
@@ -219,8 +232,10 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
     cache_dir = output_dir / ".vision-cache" / digest
     cache_dir.mkdir(parents=True, exist_ok=True)
     details, math_text, sources, table_text = [], {}, [], {}
+    backend_unavailable = False
 
     def recognize(page, box, mode, scale):
+        nonlocal backend_unavailable
         key_data = {**identity, "box": box, "page": page_number, "mode": mode, "scale": scale}
         if mode == "Table": key_data["table_profile"] = "borderless-crop-v1"
         key = hashlib.sha256(json.dumps(key_data, sort_keys=True).encode()).hexdigest()
@@ -232,16 +247,26 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
                     return cached["text"]
             except (ValueError,OSError):
                 pass
+        if backend_unavailable:
+            raise _RegionTranscriptionError("Vision OCR became unavailable; cached results and source representations retained.")
         width, height = page.get_size(); l,b,r,t = box
         padding = .7 if mode == "Text" else 0
         bitmap = page.render(scale=scale, crop=(max(0,l-padding),max(0,b-padding),max(0,width-r-padding),max(0,height-t-padding)), draw_annots=False)
         image = bitmap.to_pil(); bordered = ImageOps.expand(image, border=0 if mode == "Table" else 12, fill="white"); buffer = BytesIO()
         bordered.save(buffer, format="PNG"); bordered.close(); image.close(); bitmap.close()
-        result = request(url, "/api/generate", {
+        body = {
             "model": name, "prompt": mode + " Recognition:", "images": [base64.b64encode(buffer.getvalue()).decode()],
             "stream": False, "keep_alive": "5m",
             "options": {"temperature": 0, "seed": 0, "num_predict": 4096, "num_ctx": 8192},
-        }, timeout=timeout)
+        }
+        for attempt in range(2):
+            try:
+                result = request(url, "/api/generate", body, timeout=timeout)
+                break
+            except VisionOcrError as exc:
+                if attempt:
+                    backend_unavailable = True
+                    raise _RegionTranscriptionError(f"{exc} after one retry.") from exc
         if not isinstance(result, dict) or not isinstance(result.get("response"), str):
             raise _RegionTranscriptionError("Vision OCR returned an invalid transcription.")
         text = result["response"].strip()
@@ -292,6 +317,9 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
                             accepted = valid_math(second) and _prose_consistent(candidate, second)
                             if accepted:
                                 reason = "two resolutions agree; original OCR disagreed"
+                        if accepted and node.get("font") != "OCR" and not _native_prose_preserved(original, candidate):
+                            accepted = False
+                            reason = "native prose was omitted or adjacent prose was added; source retained"
                         details.append({"page": page_number, "kind": "prose", "accepted": accepted,
                                         "box": box, "reason": reason, "original": original,
                                         "candidate": candidate, "second": second})
@@ -417,7 +445,8 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
     finally:
         for _,_,template in templates:
             if template:template[0].close()
-    document["vision ocr"] = {**identity, "source_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(), "regions": details}
+    document["vision ocr"] = {**identity, "acceptance_profile": "native-prose-preservation-v1",
+                              "source_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(), "regions": details}
     document["math transcriptions"] = {source:_semantic_latex(text) for source,text in math_text.items()}
     document["table transcriptions"] = table_text
     document["vision sources"] = sources

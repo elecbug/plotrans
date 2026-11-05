@@ -134,6 +134,15 @@ def _repeated_margin_graphics(graphics) -> dict[int, list[Box]]:
             bitmap = page.render(scale=1, grayscale=True, draw_annots=False)
             image = bitmap.to_pil()
             mask = image.point(lambda value: 255 if value < 235 else 0).convert("L")
+            # A running rule may touch a nearby figure after dilation. Detect
+            # its thin pixel rows before connected components join them.
+            for y in list(range(int(height*.05))) + list(range(int(height*.95), int(height))):
+                row = mask.crop((0, y, int(width), y+1))
+                dense = row.histogram()[255] >= width*.8
+                bounds = row.getbbox();row.close()
+                if dense and bounds:
+                    box = (bounds[0], y, bounds[2], y+1)
+                    candidates["rule", round(y/height*300)].append((index+1, box))
             for box in _connected_regions(mask):
                 if box[3] - box[1] > height * .08: continue
                 side = "top" if box[3] < height * .09 else "bottom" if box[1] > height * .91 else ""
@@ -332,6 +341,36 @@ def _merge_regions(regions: list[Box]) -> list[Box]:
     return merged
 
 
+def _pseudocode_region(caption: dict, nodes: list[dict], width: float, height: float) -> Box | None:
+    """Text-only algorithm figures have no ink after suppressing text drawing."""
+    if not re.search(r"\bpseudocode\b", caption.get("content", ""), re.I): return None
+    cl, cb, cr, ct = caption["bounding box"]
+    if cr-cl > width*.55: return None
+    left, right = (0, width/2) if (cl+cr)/2 < width/2 else (width/2, width)
+    above = [n for n in nodes if n is not caption and (b := n.get("bounding box"))
+             and left <= (b[0]+b[2])/2 <= right and b[1] > ct
+             and n.get("content") and not n.get("suppressed")]
+    ceiling = min((n["bounding box"][1] for n in nodes if n is not caption and n.get("caption label")
+                   and (b := n.get("bounding box")) and b[1] > ct and b[0] < right and b[2] > left),
+                  default=height*.96)
+    group = [];top = ct
+    for node in sorted(above, key=lambda n: n["bounding box"][1]):
+        box = node["bounding box"];text = node["content"]
+        if box[3] > ceiling or node.get("caption label") or node.get("type") in {"header", "footer", "frontmatter"}: break
+        if box[1]-top > 45: break
+        if len(text.split()) > 25 and not re.search(r"//|;|\b(?:for|if|while|return)\b", text): break
+        if node.get("type") == "heading" and re.match(r"^(?:\d+(?:\.\d+)*\.?\s+|[IVXLCDM]+\.\s+)[A-Z]", text): break
+        group.append(node);top=max(top,box[3])
+    control = sum(bool(re.match(r"^(?:for|while|if|else|return|//)\b|^//", n["content"].strip())) for n in group)
+    if len(group) < 4 or control < 2: return None
+    for node in group:
+        if node.get("type") == "caption" and not node.get("caption label"):
+            node["type"] = "paragraph"
+    box = tuple(group[0]["bounding box"])
+    for node in group[1:]: box = _union(box, tuple(node["bounding box"]))
+    return left, max(0,height-box[3]-2), right, height-box[1]+2
+
+
 def _include_graphic_fragments(regions: list[Box], fragments: list[Box],
                                captions: list[dict], nodes: list[dict], height: float) -> list[Box]:
     """Keep small detached drawing parts beside a captioned diagram.
@@ -462,6 +501,10 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 bitmap = graphics_page.render(scale=1, grayscale=True, draw_annots=False)
                 image = bitmap.to_pil()
                 mask = image.point(lambda value: 255 if value < 235 else 0).convert("L")
+                draw = ImageDraw.Draw(mask)
+                for l,t,r,b in repeated.get(page_number, []):
+                    if b-t <= 3 and r-l >= width*.75:
+                        draw.rectangle((l-1,t-1,r+1,b+1), fill=0)
                 if page_number in document.get("ocr pages", []):
                     # Scans retain prose in their raster even after remove_text.
                     # Suppress detected text only in the search mask; final
@@ -562,6 +605,11 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                         region = _union(grouped[key][0], region)
                     grouped[key] = region, caption
                 region_captions = sorted(grouped.values(), key=lambda item: (item[0][1], item[0][0]))
+                for caption in captions:
+                    if any(owner is caption for _,owner in region_captions): continue
+                    if region := _pseudocode_region(caption, nodes, width, height):
+                        region_captions.append((region,caption))
+                region_captions.sort(key=lambda item: (item[0][1], item[0][0]))
                 for figure_index, (region, caption) in enumerate(region_captions, 1):
                     asset_dir.mkdir(parents=True, exist_ok=True)
                     filename = f"page-{page_number:03d}-fig-{figure_index:02d}.png"

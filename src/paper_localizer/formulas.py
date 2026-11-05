@@ -18,7 +18,7 @@ from .figures import _PDFIUM_LOCK, _area, _intersection, _nodes, _union
 from .markup import FIGURE_LINK, image_reference, inline_image_tag
 
 
-_MATH_FONT = re.compile(r"(?:CMMI|CMSY|CMEX|MSAM|MSBM|MTSYN|Symbol|Math)", re.I)
+_MATH_FONT = re.compile(r"(?:CMMI|CMSY|CMEX|MSAM|MSBM|MTSYN|Symbol|Math|AdvP4C4E)", re.I)
 Box = tuple[float, float, float, float]
 
 
@@ -337,7 +337,8 @@ def _remove_figure_duplicates(nodes: list[dict], spans: list[TextSpan], figure_b
         content = node.get("content", "")
         box = _box(node)
         if not content or not box: continue
-        if preserve_captions and re.match(r"^(?:-\s*)?Fig(?:ure)?\.?\s*\d", content, re.I): continue
+        if preserve_captions and (node.get("type") == "caption"
+                                  or re.match(r"^(?:-\s*)?(?:Fig(?:ure)?\.?|Table)\s*(?:\d|[IVXLCDM]+\b)", content, re.I)): continue
         selected = [span for span in spans if _inside(span.box, box)]
         marked = [replace(span, math=any(
             figure and _intersection(span.box, figure) / max(_area(span.box), 1) >= 0.7
@@ -409,6 +410,43 @@ def _reconcile_snapshots(nodes: list[dict], spans: list[TextSpan], assets: list[
         partial = [n for n in nodes if n is not owner and id(n) not in suppressed
                    and not n.get("formula snapshot") and not FIGURE_LINK.search(n.get("content", ""))]
         changed += _remove_figure_duplicates(partial, spans, [region], preserve_captions=False)
+    return changed
+
+
+def _merge_legacy_equation_snapshots(nodes: list[dict], spans: list[TextSpan], assets: list[dict], save) -> int:
+    """Unify overlapping pieces of a display equation in legacy math fonts."""
+    if not any(re.search(r"AdvP4C4E", s.font_name, re.I) for s in spans): return 0
+    regions={a["source"]:tuple(a["bounding box"]) for a in assets if a.get("block")}
+    candidates=[]
+    for node in nodes:
+        if node.get("suppressed") or node.get("type") in {"heading", "caption"}: continue
+        markup=node.get("formula snapshot") or (node.get("content", "") if node.get("formula image") else "")
+        match=next(FIGURE_LINK.finditer(markup),None)
+        if not match or (source:=image_reference(match).source) not in regions: continue
+        box=regions[source];selected=[s for s in spans if _inside(s.box,box,padding=0)]
+        if not selected or not any(re.search(r"AdvP4C4E",s.font_name,re.I) for s in selected): continue
+        if any(not s.math and re.search(r"[A-Za-z]{3,}",s.text) for s in selected): continue
+        candidates.append((node,box))
+    groups=[]
+    for node,box in candidates:
+        members=[node]
+        while True:
+            hit=next((i for i,(others,other) in enumerate(groups)
+                      if min(box[3],other[3])-max(box[1],other[1])>0
+                      and max(box[0]-other[2],other[0]-box[2],0)<=14
+                      and _area(_union(box,other))<=max(_area(box),_area(other))*3),None)
+            if hit is None:break
+            others,other=groups.pop(hit);members.extend(others);box=_union(box,other)
+        groups.append((members,box))
+    changed=0
+    for members,box in groups:
+        if len(members)<2:continue
+        owner=members[0];image=save(box,block=True)
+        owner["bounding box"]=list(box)
+        if owner.get("formula image"):owner["content"]=image
+        else:owner["formula snapshot"]=image
+        for node in members[1:]:
+            node["content"]="";node.pop("formula snapshot",None);node["suppressed"]=True;changed+=1
     return changed
 
 
@@ -637,6 +675,8 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 page_nodes = [n for n in _nodes(document) if n.get("page number") == page_number]
                 document["deduplicated equation text"] = document.get("deduplicated equation text", 0) + _reconcile_snapshots(
                     page_nodes, spans, [a for a in formulas if a["page number"] == page_number])
+                document["merged legacy equation fragments"] = document.get("merged legacy equation fragments", 0) + _merge_legacy_equation_snapshots(
+                    page_nodes, spans, [a for a in formulas if a["page number"] == page_number], save)
             finally:
                 page.close()
     active = {image_reference(m).source for node in _nodes(document) if not node.get("suppressed")

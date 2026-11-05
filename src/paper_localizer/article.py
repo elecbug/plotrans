@@ -129,6 +129,16 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
             abstract_mode = False
             pending_figure = None
             continue
+        if chunk.kind in {"abstract", "abstract-image"}:
+            if chunk.source.strip():
+                article.abstract.append(Unit(_ABSTRACT.sub("", chunk.source), _ABSTRACT.sub("", translated),
+                                             kind="formula" if chunk.kind == "abstract-image" else "text", pages=chunk.pages))
+            pending_figure = None
+            continue
+        if chunk.kind == "table" and chunk.table_data:
+            append(Unit(chunk.source, translated, kind="native-table", pages=chunk.pages, table_data=chunk.table_data))
+            pending_figure = None
+            continue
         if chunk.kind in {"caption", "caption-image"}:
             # A source-only caption crop has no machine translation. Showing
             # it in both columns would duplicate the image under a false label.
@@ -157,8 +167,14 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
             append(unit)
             pending_figure = unit if chunk.kind in {"figure", "table-image"} else None
             continue
-        source_parts = chunk.source.split("\n\n")
+        # Model/OCR text may itself contain blank lines. They are not the
+        # boundaries used when assigning the source paragraph identifiers.
+        source_parts = list(chunk.source_parts) if chunk.source_parts else chunk.source.split("\n\n")
         paragraph_ids = list(chunk.paragraph_ids) if chunk.paragraph_ids else [""] * len(source_parts)
+        if len(paragraph_ids) != len(source_parts):
+            # Accept older serialized chunks without inventing a correspondence
+            # between their text fragments and a shorter identifier list.
+            paragraph_ids = [""] * len(source_parts)
         target_parts = translated.split("\n\n") if translated else []
         heading = _HEADING.match(source_parts[0])
         if heading:
@@ -201,8 +217,12 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
     return article
 
 
-def _safe_markdown(text: str) -> str:
+def _safe_markdown(text: str, math_tokens: dict[str, str] | None = None,
+                   math_originals: dict[str, str] | None = None) -> str:
     parts, cursor = [], 0
+    token_prefix = "PLoTransOpaqueMath"
+    while token_prefix in text:
+        token_prefix += "X"
     tokens = [(match.start(), match, "image") for match in FIGURE_LINK.finditer(text)]
     tokens += [(match.start(), match, "math") for match in LATEX.finditer(text)
                if not any(image.start() <= match.start() < image.end() for image in FIGURE_LINK.finditer(text))]
@@ -210,13 +230,24 @@ def _safe_markdown(text: str) -> str:
         if match.start() < cursor: continue
         parts.append(escape(text[cursor:match.start()], quote=False))
         if kind == "math":
-            try: parts.append(mathml(expression(match), bool(match.group(1) or match.group(4))))
+            try:
+                rendered = mathml(expression(match), bool(match.group(1) or match.group(4)))
+                rendered = '<span class="math-scroll">' + rendered + '</span>'
+                if math_tokens is not None:
+                    token = f"{token_prefix}{len(math_tokens)}End"
+                    math_tokens[token] = rendered
+                    if math_originals is not None:
+                        math_originals[token] = match.group(0)
+                    parts.append(token)
+                else:
+                    parts.append(rendered)
             except Exception: parts.append(escape(match.group(0)))
             cursor = match.end()
             continue
         ref = image_reference(match)
         if ref.inline:
-            parts.append(inline_image_tag(ref.source, ref.alt, ref.height_em, ref.align_em, ref.aspect_ratio))
+            parts.append(f'<span class="inline-math-scroll" style="vertical-align:{ref.align_em:.3f}em">' +
+                         inline_image_tag(ref.source, ref.alt, ref.height_em, 0, ref.aspect_ratio) + '</span>')
         else:
             parts.append(f"![{escape(ref.alt)}]({ref.source})")
         cursor = match.end()
@@ -225,12 +256,31 @@ def _safe_markdown(text: str) -> str:
 
 
 def _md_html(text: str, inline: bool = False) -> str:
-    safe = _safe_markdown(text)
-    return _MARKDOWN.renderInline(safe) if inline else _MARKDOWN.render(safe)
+    math_tokens: dict[str, str] = {}
+    math_originals: dict[str, str] = {}
+    safe = _safe_markdown(text, math_tokens, math_originals)
+    rendered = _MARKDOWN.renderInline(safe) if inline else _MARKDOWN.render(safe)
+    # MathML must remain opaque to Markdown's emphasis/link parsers. Literal
+    # stars in two equations otherwise produce crossed <em>/<mo> elements.
+    if math_tokens:
+        pattern = re.compile("|".join(map(re.escape, math_tokens)))
+        parts = re.split(r"(<[^>]*>)", rendered)
+        for i,part in enumerate(parts):
+            # A dollar-containing URL or link title must remain an attribute,
+            # rather than receiving an HTML subtree inside its quoted value.
+            parts[i] = pattern.sub(lambda match: escape(math_originals[match.group()], quote=True)
+                                   if i%2 else math_tokens[match.group()], part)
+        rendered = "".join(parts)
+    return rendered
 
 
 def _unit_markdown(unit: Unit) -> str:
     page = ", ".join(map(str, unit.pages))
+    if unit.kind == "native-table" and unit.table_data:
+        text = f"<!-- p.{page} -->\n\n" + table_html(unit.table_data["rows"], lambda text: _md_html(text, inline=True))
+        if unit.translation:
+            text += "\n\n<details>\n<summary>Translation</summary>\n\n" + render_math(unit.translation) + "\n\n</details>"
+        return text + ("\n\n" + _links_markdown(unit.links) if unit.links else "")
     text = f"<!-- p.{page} -->\n\n" + (unit.source if unit.kind == "code" else render_math(unit.source))
     if unit.translation:
         text += "\n\n<details>\n<summary>Translation</summary>\n\n" + render_math(unit.translation) + "\n\n</details>"
@@ -311,6 +361,11 @@ def article_markdown(article: Article) -> str:
 
 def _unit_html(unit: Unit) -> str:
     pages = ", ".join(map(str, unit.pages))
+    if unit.kind == "native-table" and unit.table_data:
+        source = '<div class="native-table-scroll">' + table_html(unit.table_data["rows"], lambda text: _md_html(text, inline=True)) + '</div>'
+        translated = '<div class="translation">' + _md_html(unit.translation) + '</div>' if unit.translation else ""
+        return (f'<div class="reading-pair{" has-translation" if translated else ""}"><div class="source">{source}</div>'
+                + translated + f'</div><span class="page-reference">p.{pages}</span>' + _links_html(unit.links))
     dimensions = f' width="{unit.image_size[0]}" height="{unit.image_size[1]}"' if unit.image_size else ""
     if unit.kind == "code":
         source = re.sub(r"^```[^\n]*\n|\n```$", "", unit.source)
