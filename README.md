@@ -102,9 +102,9 @@ OCR paragraphs use page coordinates to reconstruct reading order and columns. Re
 
 Raw OCR results are cached in `.ocr-cache/` under the output directory, keyed by PDF content, engine version, and DPI. Paragraph layout and confidence filtering are reapplied when using the cache. OCR confidence is not an accuracy guarantee. The base OCR path does not automatically convert complex equations to LaTeX or reconstruct complex table cells. Local inference for this path was validated on the 13-page Kademlia paper and synthetic scanned PDFs.
 
-### Optional document and equation OCR
+### Optional document, table, and equation OCR
 
-The local Ollama model `glm-ocr:latest` can additionally verify superscripts, subscripts, and prose containing equations that basic OCR may miss. HY-MT2-7B remains the translation model. GLM-OCR is a separate document recognition model; after downloading its weights, source content stays local. No additional PyTorch installation is required.
+The local Ollama model `glm-ocr:latest` can additionally verify superscripts, subscripts, and prose containing equations that basic OCR may miss, and provide searchable transcriptions of image tables. HY-MT2-7B remains the translation model. GLM-OCR is a separate document recognition model; after downloading its weights, source content stays local. No additional PyTorch installation is required.
 
 ```sh
 ollama pull glm-ocr:latest
@@ -113,21 +113,25 @@ paper-localizer extract "paper.pdf" -o outputs/paper.extracted.md --vision-ocr-m
 paper-localizer run "paper.pdf" -o outputs/paper.translated.md --vision-ocr-model glm-ocr:latest
 ```
 
-In the web UI, open **Settings** and select **High quality document OCR**:
+In the web UI, select **High quality document OCR** below the upload control:
 
 - **Disabled** (default): use the standard extraction and OCR settings.
-- **glm-ocr:latest**: enable additional document and equation verification.
+- **glm-ocr:latest**: enable additional table transcription and document/equation verification.
 - **Custom model**: enter another compatible Ollama model name.
 
 You can select a model before installing it. Availability is checked only when you click the processing button. If the model is missing, the UI shows a warning with the required `ollama pull` command and stops before processing the PDF. An unavailable Ollama server also produces a warning. Prepare Ollama and the model, then retry, or select **Disabled**. The app does not download models automatically or silently substitute another OCR mode.
 
 For Docker, install the model with `docker compose exec ollama ollama pull glm-ocr:latest`. The selection applies to both processing modes. Without a GPU, the model runs on the CPU and processing takes longer. In the CLI, use `--vision-ocr-url` to select a separate OCR Ollama server. Base CPU extraction continues to work without these optional settings.
 
-Equations are rendered from the original PDF at 4x and 6x resolution, with an 8x check when results disagree. Only white padding is added outside each equation's owned region, avoiding neighboring characters. Decodable equations on a single line are first checked against source Unicode and character sizes. Other equations are compared across resolutions and against readable source digits and variables. Repeated short equations are compared with validated equations in the same PDF, using both whole images and individual glyphs.
+Decodable equations on a single line are first checked against source Unicode, effective character sizes, and baseline positions to preserve subscripts and superscripts. Other equations are rendered from the original PDF at 4x and 6x resolution, with an 8x check when results disagree. Only white padding is added outside each equation's owned region, avoiding neighboring characters. These transcriptions are compared across resolutions and against readable source digits and variables. Repeated short equations are compared with checked equations in the same PDF, using both whole images and individual glyphs.
 
 Accepted OCR prose is restored as editable text with LaTeX equations, rendered offline as MathML in HTML and Markdown. Original equation images stay in position, and their recognized meaning is provided to translation and summary models. Recovered source regions remain available in a collapsed comparison section. Equations that fail agreement checks remain images and are marked so models do not guess their content. Agreement checks do not guarantee accuracy.
 
-The `.ocr.json` output and ZIP record the actual model SHA-256 digest, preprocessing profile, region decisions, and equation transcriptions. `.vision-cache/` uses PDF content, model digest, region, resolution, and profile as its key. Use `--vision-ocr-digest` to verify the exact model version when reproducing a run. The model digest used for the documented experiment was:
+Tables whose text is drawn as vector outlines cannot be recovered through native text extraction. Their original images remain in the article, with captions above them. Optional OCR adds a collapsible **Searchable table transcription** only after two rendering resolutions agree on cells and spans, and independent CPU OCR supports at least 98% of long words and every plain numeric value. It checks 3x and 4.5x crops, with a 6x retry when needed. Install the `ocr` extra for this independent check. Equations inside cells still require visual review; consistency does not establish correct interpretation or cell assignment. Table images and transcriptions are not translated.
+
+Malformed table markup and empty or truncated region responses retain their source representation and record the reason in the OCR report. Model setup and initial connection errors stop processing with setup instructions.
+
+The `.ocr.json` output and ZIP record the actual model SHA-256 digest, preprocessing profile, region decisions, and equation/table transcriptions. `.vision-cache/` uses PDF content, model digest, region, resolution, and profile as its key. Use `--vision-ocr-digest` to verify the exact model version when reproducing a run. The model digest used for the documented experiment was:
 
 ```text
 89d735dd9c07791953756edd275e5501464df61288b1cd5486c5c50c8c058b32
@@ -170,6 +174,12 @@ Figure extraction found eight regions across the nine-page Bitcoin paper and ten
 
 The original abstract and generated summary are displayed separately. The body retains the paper's section and paragraph order. The HTML reading layout draws on IEEE Xplore: a left table of contents, title and author information, abstract, body, figures with captions in context, and references. The header reads `PLoTrans`. Translated documents provide **Original**, **Translation**, and **Parallel view** controls, print styles, and layouts for smaller screens. Markdown follows the same section order with collapsible translations.
 
+Source glyphs and page geometry repair run-in headings and common two-column reading order, including full-width figures and tables. Heading promotion and spacing repairs require matching source characters. Authors, index terms, and small first-page notes retain separate roles. Continued source paragraphs are rejoined across page/column and model chunk boundaries. Figures, tables, and portraits reserve their space while loading, keeping document positions stable when navigating the table of contents. Complex layouts still need source review.
+
+Web links stored in PDF annotations are retained. Printed targets are connected to a unique matching passage on the same source page. ORCID identifiers remain source metadata without guessing which author owns an icon. Other unmatched links remain in a collapsed list. Wrapped URL spaces and omitted DOI hyphens are repaired only when the PDF annotation and decoded source glyphs confirm the same target; source digits, case, and other punctuation must agree.
+
+In numbered reference sections, hanging-indent continuation lines retain their reference's paragraph identity. URLs split between reference blocks are rejoined only when the complete target is confirmed by the source page. This keeps split publication years and URLs within the same entry and prevents a year such as `2001.` from becoming an HTML list number.
+
 If translation is interrupted, a `.progress.json` checkpoint remains next to the output file. Rerun with the same PDF, models, settings, and output path to skip completed chunks. Successful completion removes the checkpoint. HTML files can be opened locally without a CDN or server.
 
 ## Separating figures from text
@@ -177,6 +187,8 @@ If translation is interrupted, a `.progress.json` checkpoint remains next to the
 Alongside OpenDataLoader's text structure, the app renders an in-memory PDF with text display instructions removed to detect actual graphic regions. This preserves both JPG/PNG images and vector figures made from PDF shapes, arrows, and charts as PNG files. The original PDF is never modified.
 
 Text inside figures remains in the figure and is excluded from duplicate body extraction. Rotated axis titles and nearby labels are included in figure regions. Labels in PDF Form XObjects are checked against transformed page character coordinates. Short captions do not reduce figure width. Panels sharing a caption are grouped, while figures in different columns remain separate. Ordinary tables with a clear structure remain Markdown tables.
+
+Repeated margin artwork is excluded before caption matching, preventing journal headers from joining nearby figures. Small detached drawing fragments are assigned to a nearby captioned figure when their positions support it. Author portraits beside degree biographies are kept separately from numbered figures.
 
 Captions misclassified as headings or split across blocks are reconnected using fonts, positions, and line spacing. Captions stay intact across chunk boundaries and are attached to figures as complete units. Ordinary captions are normalized to `Fig.`; source image captions containing equations are preserved. Unmatched captions remain in the body.
 
@@ -222,7 +234,7 @@ The base path preserves equations visually without automatic LaTeX conversion or
 - The default OpenDataLoader path suits PDFs with text. Local OCR supplements scans and undecodable pages. Figures retain their original appearance; internal labels are not translated, and complex layouts are not analyzed semantically.
 - Pages made entirely of undecodable fonts, such as those in Kademlia, use the default OCR path to recover prose. If OCR is disabled or recognizes no text, a source image and explanation are retained. Compare equations and proper names with the source pages.
 - Figure extraction uses rules based on pixels, coordinates, and captions. Review documents with overlapping figures and text or patterned backgrounds against their originals.
-- Tables are reconstructed from JSON as Markdown tables. Check merged cells and complex tables against the PDF.
+- Native tables with usable cells become Markdown tables. Other tables retain source images; optional document OCR can add checked searchable transcriptions. Check merged cells, row/column assignments, equations, and important values against the PDF.
 - Translations and summaries are generated by local models. Verify important numbers, equations, and citations against the original.
 - `outputs/` may contain original and translated paper content. Review it before sharing.
 
@@ -236,7 +248,15 @@ python scripts/audit_corpus.py .tmp/example --output outputs/review --sheets
 
 An integration test runs the real bundled OCR models offline. It is skipped by default. In PowerShell, set `$env:PLOTRANS_TEST_OCR="1"` before running the tests. On macOS/Linux, use `PLOTRANS_TEST_OCR=1 python -m unittest discover -s tests -v`.
 
-The corpus audit processes all PDFs in a directory and produces per-paper Markdown, HTML, and ZIP files, source/figure/caption comparison sheets, and `audit-report.html`, `.md`, and `.json`. It checks image files and internal links, text duplicated by equation images, missing or unmatched captions, undecodable characters, and page image fallbacks. OpenDataLoader JSON is cached in `.scratch/corpus/native/`; clear that cache after changing the source PDF. Automated checks do not guarantee semantic completeness, so review the comparison sheets alongside the original.
+The corpus audit processes all PDFs in a directory and produces per-paper Markdown, HTML, and ZIP files, source/figure/caption comparison sheets, and `audit-report.html`, `.md`, and `.json`. It checks image files and internal/source links, text duplicated by equation images, missing or unmatched captions, undecodable characters, and page image fallbacks. OpenDataLoader JSON is cached in `.scratch/corpus/native/` using PDF content, engine version, and extraction profile, so changed PDFs and different papers sharing a filename do not reuse each other's parsing data. Automated checks do not guarantee semantic completeness, so review the comparison sheets alongside the original.
+
+For a page-by-page comparison, pass the processed audit JSON and its Markdown export:
+
+```sh
+python scripts/review_comparison.py .tmp/example/paper.pdf outputs/review/paper.audit.json outputs/review/paper.md --output outputs/review/page-comparison
+```
+
+Open `page-comparison/review.html` for all source pages alongside their extracted content. `review.json` checks decodable letter/digit preservation in the processed structure or retained images and identifies missing or blank assets. Caption abbreviations are counted separately. This check does not establish semantic accuracy, reading order, complete graphics, or correct OCR.
 
 The documented audit of 18 example papers validated extraction without running Ollama inference. Tests cover duplicated piecewise equations, split captions, multiple panels across two columns, Form XObject coordinates, subscripts, undecodable-font preservation, and output bundles.
 

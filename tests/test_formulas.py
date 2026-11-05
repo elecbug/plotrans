@@ -8,7 +8,8 @@ from pypdf.generic import (ArrayObject, DecodedStreamObject, DictionaryObject,
 
 from paper_localizer.bundle import FIGURE_LINK, build_bundle, inline_equation_preview
 from paper_localizer.core import ProcessingError, _split_text, _translate_chunk, extract_blocks
-from paper_localizer.formulas import TextSpan, _expand_expressions, _groups, _remove_figure_duplicates, recover_formulas
+from paper_localizer.formulas import (TextSpan, _expand_expressions, _groups, _insertions,
+                                      _plain_text_group, _remove_figure_duplicates, recover_formulas)
 from paper_localizer.markup import image_reference, inline_image_tag
 from io import BytesIO
 from zipfile import ZipFile
@@ -63,6 +64,56 @@ def math_fixture(path: Path) -> dict:
 
 
 class FormulaTests(unittest.TestCase):
+    def test_inline_crop_keeps_source_space_before_a_citation(self):
+        from test_structure import fixture_pdf, paragraph
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / 'citation.pdf'
+            fixture_pdf(source, [b'BT /F2 10 Tf 30 500 Td (Bound ) Tj ET '
+                                 b'BT /F1 10 Tf 63 500 Td (f) Tj ET '
+                                 b'BT /F2 10 Tf 74 500 Td ([22].) Tj ET'])
+            document = {'kids': [paragraph('Bound f [22].', [30, 490, 280, 515])]}
+            recover_formulas(source, document, root)
+            self.assertRegex(document['kids'][0]['content'], r'<img\b[^>]+/> \[22\]\.\Z')
+
+    def test_touching_punctuation_is_owned_once_by_the_source_crop(self):
+        spans = [TextSpan(0, "Before", (10, 60, 35, 70), False, 10, 60, "Roman"),
+                 TextSpan(1, "x", (40, 60, 47, 70), True, 10, 60, "Italic"),
+                 TextSpan(2, ".", (47.2, 60, 49, 62), False, 10, 60, "Roman")]
+        groups = _groups(spans)
+        self.assertEqual([[s.text for s in g] for g in groups], [["x", "."]])
+        self.assertEqual(_insertions("Before x.", spans, groups), [(7, 9)])
+
+    def test_separated_citation_does_not_become_part_of_a_formula(self):
+        spans = [TextSpan(0, "f", (10, 60, 16, 70), True, 10, 60, "Italic"),
+                 TextSpan(1, "(", (16.5, 58, 20, 71), False, 10, 60, "Roman"),
+                 TextSpan(2, "x", (20.5, 60, 27, 70), True, 10, 60, "Italic"),
+                 TextSpan(3, ")", (27.5, 58, 31, 71), False, 10, 60, "Roman"),
+                 TextSpan(4, "[", (35, 58, 38, 71), False, 10, 60, "Roman"),
+                 TextSpan(5, "22", (38.5, 60, 49, 70), False, 10, 60, "Roman"),
+                 TextSpan(6, "]", (49.5, 58, 53, 71), False, 10, 60, "Roman")]
+        groups = _groups(_expand_expressions(spans))
+        self.assertEqual(["".join(s.text for s in g) for g in groups], ["f(x)"])
+        attached = [TextSpan(0, "A", (10, 60, 16, 70), True, 10, 60, "Italic")] + [
+            TextSpan(s.index, s.text, (s.box[0]-18, *s.box[1:2], s.box[2]-18, s.box[3]),
+                     s.math, s.font_size, s.baseline, s.font_name) for s in spans[4:]]
+        self.assertEqual(["".join(s.text for s in g) for g in _groups(_expand_expressions(attached))], ["A[22]"])
+
+    def test_prose_labels_and_acronyms_stay_text_but_scripts_stay_math(self):
+        label = [TextSpan(0, "A", (10, 60, 17, 70), True, 10, 60, "Helvetica-Oblique"),
+                 TextSpan(1, ".", (17.2, 60, 19, 62), False, 10, 60, "Helvetica-Oblique")]
+        self.assertTrue(_plain_text_group(label, {"type": "heading", "content": "A. METHODS"}))
+        self.assertTrue(_plain_text_group(label[:1], {"type": "heading", "content": "A. METHODS"}))
+        self.assertFalse(_plain_text_group(label, {"type": "paragraph", "content": "A. METHODS"}))
+        acronym = [TextSpan(0, "P", (10, 60, 17, 70), True, 10, 60, "Times-Italic"),
+                   TextSpan(1, "2", (17.2, 60, 22, 70), True, 10, 60, "Times-Italic"),
+                   TextSpan(2, "P", (22.2, 60, 29, 70), True, 10, 60, "Times-Italic")]
+        self.assertTrue(_plain_text_group(acronym, {"content": "P2P systems."}))
+        acronym[1] = TextSpan(1, "2", (17.2, 57, 22, 63), True, 7, 57, "Times-Italic")
+        self.assertFalse(_plain_text_group(acronym, {"content": "P2P systems."}))
+        bullet = [TextSpan(0, "•", (10, 60, 15, 65), True, 10, 60, "Symbol")]
+        self.assertTrue(_plain_text_group(bullet, {"content": "• First requirement."}))
+        self.assertFalse(_plain_text_group(bullet, {"content": "The operator • is used."}))
+
     def test_named_subscript_stays_with_its_math_identifier(self):
         spans = [TextSpan(0, "D", (30, 60, 39, 71), True, 10, 60, "MathMI"),
                  TextSpan(1, "lazy", (39, 57, 54, 63), False, 7, 57, "Roman"),

@@ -6,10 +6,12 @@ import argparse
 from copy import deepcopy
 from html.parser import HTMLParser
 import hashlib
+from importlib.metadata import version
 import json
 from pathlib import Path
 import re
 import sys
+import tempfile
 import time
 
 from PIL import Image, ImageDraw
@@ -29,15 +31,23 @@ CAPTION = re.compile(r"^(?:-\s*)?(?:Fig(?:ure)?\.?|Table)\s*\d+", re.I)
 
 class LinkAudit(HTMLParser):
     def __init__(self, html):
-        super().__init__(); self.ids = set(); self.links = []; self.feed(html)
+        super().__init__(); self.ids = set(); self.links = []; self.external = set(); self.feed(html)
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         if "id" in attrs: self.ids.add(attrs["id"])
         if tag == "a" and attrs.get("href", "").startswith("#"): self.links.append(attrs["href"][1:])
+        if tag == "a" and attrs.get("href", "").lower().startswith(("http://", "https://")): self.external.add(attrs["href"])
 
 
 def slug(path: Path) -> str:
     return re.sub(r"[^a-z0-9]+", "-", path.stem.lower()).strip("-")[:100]
+
+
+def native_cache_path(pdf: Path, directory: Path, engine_version: str) -> Path:
+    identity = {"source_sha256": hashlib.sha256(pdf.read_bytes()).hexdigest(),
+                "engine": engine_version, "profile": "json-without-images-v1"}
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
+    return directory / f"{pdf.stem}-{digest}.json"
 
 
 def metrics(document: dict, raw: dict, output: Path) -> dict:
@@ -56,6 +66,7 @@ def metrics(document: dict, raw: dict, output: Path) -> dict:
     raw_captions = prepare_layout(deepcopy(raw)).get("captions", [])
     all_units = article.front + article.abstract + [u for s in article.sections for u in s.units]
     attached = [u for u in all_units if u.kind == "figure" and u.caption]
+    attached_tables = [u for u in all_units if u.kind == "table-image" and u.caption]
     detached = [{"page":n.get("page number"), "label":n["caption label"]}
                 for n in _nodes(document) if n.get("caption label", "").startswith("Fig.")
                 and n.get("type") == "caption" and not n.get("attached caption") and not n.get("suppressed")]
@@ -68,16 +79,26 @@ def metrics(document: dict, raw: dict, output: Path) -> dict:
     html = output.with_suffix(".html").read_text(encoding="utf-8")
     refs = {image_reference(m).source for m in FIGURE_LINK.finditer(markdown + "\n" + html)}
     audit = LinkAudit(html)
-    return {"pages": document.get("number of pages"), "figures": len(document.get("figures", [])),
+    graphics = document.get("figures", [])
+    return {"pages": document.get("number of pages"),
+            "figures": sum(f.get("asset kind", "figure") == "figure" for f in graphics),
+            "tables": sum(f.get("asset kind") == "table" for f in graphics),
+            "portraits": sum(f.get("asset kind") == "portrait" for f in graphics),
+            "graphic_regions": len(graphics),
             "equations": len(document.get("formulas", [])), "source_caption_starts": len(raw_captions),
             "attached_figure_captions": len(attached), "overlapping_text": overlap,
+            "attached_table_captions": len(attached_tables),
+            "table_transcriptions": len(document.get("table transcriptions", {})),
             "detached_captions": detached, "source_image_pages": document.get("source image pages", []),
             "missing_source_captions": lost,
             "sections": len(article.sections),
             "ocr_pages": document.get("ocr pages", []), "ocr_details": document.get("ocr details", []),
             "unresolved_glyphs": len(re.findall(r"[\ue000-\uf8ff\ufffd]", visible)),
             "missing_assets": [ref for ref in refs if not (output.parent / ref).is_file()],
-            "broken_anchors": [link for link in audit.links if link not in audit.ids]}
+            "broken_anchors": [link for link in audit.links if link not in audit.ids],
+            "source_links": len(document.get("source links", [])),
+            "missing_source_links": [link["url"] for link in document.get("source links", [])
+                                     if link["url"] not in audit.external]}
 
 
 def review_sheet(pdf: Path, document: dict, destination: Path) -> None:
@@ -124,17 +145,22 @@ def main() -> None:
     filters = args.only.lower().split(",")
     pdfs = [p for p in sorted(args.input.glob("*.pdf")) if any(part.strip() in p.name.lower() for part in filters)]
     args.output.mkdir(parents=True, exist_ok=True); args.cache.mkdir(parents=True, exist_ok=True)
-    missing = [p for p in pdfs if not (args.cache / (p.stem + ".json")).is_file()]
+    native_files = {pdf: native_cache_path(pdf, args.cache, version("opendataloader-pdf")) for pdf in pdfs}
+    missing = [p for p in pdfs if not native_files[p].is_file()]
     if missing:
         import opendataloader_pdf
         print(f"Extracting {len(missing)} uncached PDFs with OpenDataLoader", flush=True)
-        opendataloader_pdf.convert(input_path=[str(p.resolve()) for p in missing],
-                                  output_dir=str(args.cache.resolve()), format="json", image_output="off", quiet=True)
+        with tempfile.TemporaryDirectory(prefix="paper-localizer-native-audit-", dir=args.cache.resolve()) as temporary:
+            staging = Path(temporary)
+            opendataloader_pdf.convert(input_path=[str(p.resolve()) for p in missing],
+                                      output_dir=str(staging), format="json", image_output="off", quiet=True)
+            for pdf in missing:
+                (staging / (pdf.stem + ".json")).replace(native_files[pdf])
     results = []
     for index, pdf in enumerate(pdfs, 1):
         start = time.monotonic()
         try:
-            raw = json.loads((args.cache / (pdf.stem + ".json")).read_text(encoding="utf-8"))
+            raw = json.loads(native_files[pdf].read_text(encoding="utf-8"))
             document = deepcopy(raw)
             if hasattr(core, "prepare_document"):
                 document = core.prepare_document(pdf, document, args.output,ocr=OcrOptions(
@@ -144,7 +170,9 @@ def main() -> None:
             output = args.output / (slug(pdf) + ".md")
             write_article(document, core._document_title(document, pdf.name), pdf.name,
                           core.make_chunks(core.extract_blocks(document)), None, "", "English", output)
-            result = {"file": pdf.name, "output": output.name, **metrics(document, raw, output)}
+            result = {"file": pdf.name, "output": output.name,
+                      "source_sha256": hashlib.sha256(pdf.read_bytes()).hexdigest(),
+                      **metrics(document, raw, output)}
             (args.output / (slug(pdf) + ".audit.json")).write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
             if args.sheets: review_sheet(pdf, document, args.output / (slug(pdf) + ".review.png"))
         except Exception as exc:

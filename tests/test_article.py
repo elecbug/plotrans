@@ -24,6 +24,17 @@ class Audit(HTMLParser):
 
 
 class ArticleTests(unittest.TestCase):
+    def test_graphics_reserve_their_source_aspect_ratio_before_lazy_loading(self):
+        document = {"figures": [
+            {"source": "figs/paper/plot.png", "pixel size": [1200, 600]},
+            {"source": "figs/paper/portrait.png", "pixel size": [300, 450]}]}
+        chunks = [Chunk(1, (1,), "## Body"),
+                  Chunk(2, (1,), "![Plot](figs/paper/plot.png)", "figure"),
+                  Chunk(3, (1,), "![Author](figs/paper/portrait.png)", "portrait")]
+        html = article_html(build_article(document, "Paper", "paper.pdf", chunks), "paper.md")
+        self.assertIn('alt="Plot" width="1200" height="600" loading="lazy"', html)
+        self.assertIn('alt="Author" width="300" height="450" loading="lazy"', html)
+
     def test_source_only_caption_image_is_not_duplicated_as_a_translation(self):
         image="![Original caption](figs/paper/caption.png)"
         chunks=[Chunk(1,(1,),"![Plot](figs/paper/plot.png)","figure"),

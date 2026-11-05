@@ -14,6 +14,51 @@ from test_formulas import math_fixture
 
 
 class VisionTests(unittest.TestCase):
+    def test_incomplete_region_response_preserves_source_and_records_failure(self):
+        for response in ({"response": "$$x", "done_reason": "length"},
+                         {"response": "", "done_reason": "stop"},
+                         {"response": None, "done_reason": "stop"}):
+            with self.subTest(response=response), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); pdf = root / "source.pdf"; math_fixture(pdf)
+                source = "figs/test/equation.png"
+                (root / source).parent.mkdir(parents=True)
+                Image.new("RGB", (50, 30), "white").save(root / source)
+                document = {"kids": [{"type": "formula", "page number": 1,
+                    "content": f"![Eq]({source})", "formula image": True,
+                    "bounding box": [80, 60, 110, 75]}],
+                    "formulas": [{"page number": 1, "source": source,
+                                  "bounding box": [80, 60, 110, 75]}]}
+                def request(url, path, body=None, **kwargs):
+                    return ({"models": [{"name": "glm-ocr:latest", "digest": "model"}]}
+                            if path == "/api/tags" else response)
+                refine_document(pdf, document, root, model="glm-ocr:latest",
+                                url="http://localhost:11434", requester=request)
+                self.assertEqual(document["math transcriptions"], {})
+                self.assertEqual(document["kids"][0]["content"], f"![Eq]({source})")
+                self.assertFalse(document["vision ocr"]["regions"][0]["accepted"])
+                self.assertIn("retained", document["vision ocr"]["regions"][0]["reason"])
+                self.assertTrue((root / source).is_file())
+
+    def test_table_consensus_still_requires_independent_numeric_support(self):
+        for verified in (True, False):
+            with self.subTest(verified=verified), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); pdf = root / "source.pdf"; math_fixture(pdf)
+                source = "figs/test/table.png"
+                document = {"kids": [], "figures": [{"page number": 1, "source": source,
+                    "asset kind": "table", "bounding box": [30, 60, 180, 120]}]}
+                def request(url, path, body=None, **kwargs):
+                    return ({"models": [{"name": "glm-ocr:latest", "digest": "model"}]}
+                            if path == "/api/tags" else {"response":
+                                "<table><tr><th>Method</th><th>Value</th></tr>"
+                                "<tr><td>Example</td><td>12.5</td></tr></table>", "done_reason": "stop"})
+                with patch("paper_localizer.vision._verify_table_image",
+                           return_value={"accepted": verified, "numeric_values_checked": 1}) as verify:
+                    refine_document(pdf, document, root, model="glm-ocr:latest",
+                                    url="http://localhost:11434", requester=request)
+                verify.assert_called_once()
+                self.assertEqual(bool(document["table transcriptions"]), verified)
+                self.assertEqual(document["vision ocr"]["regions"][0]["accepted"], verified)
+
     def test_typography_changes_are_checked_separately_from_ocr_confidence(self):
         self.assertTrue(_math_line('distance between 2i and 2i+1 from itself.'))
         self.assertTrue(_math_line('with probability 1 - 2−k.'))

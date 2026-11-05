@@ -18,6 +18,9 @@ from PIL import Image, ImageChops, ImageOps
 
 from .figures import _PDFIUM_LOCK, _nodes, _area
 from .markup import FIGURE_LINK, image_reference
+from .tables import (TableError, parse_table, table_column_bounds, table_grid,
+                     tables_agree, verify_table_text)
+from .native_math import native_expression
 
 
 VISION_VERSION = "glm-crops-4x-6x-v2"
@@ -26,6 +29,10 @@ DEFAULT_VISION_MODEL = "glm-ocr:latest"
 
 class VisionOcrError(RuntimeError):
     pass
+
+
+class _RegionTranscriptionError(VisionOcrError):
+    """A model response failed for one crop; keep that source representation."""
 
 
 def _request(url: str, path: str, body=None, timeout: int = 300):
@@ -142,6 +149,55 @@ def _same_short_formula(first, second) -> bool:
     return True
 
 
+def _verify_table_image(page, box, rows, cache_dir: Path, identity: dict) -> dict:
+    from .ocr import OCR_VERSION, _recognize
+
+    width, height = page.get_size(); left, bottom, right, top = box
+    attempts = []
+    for scale in (3, 4.5):
+        profile = {**identity, "ocr": OCR_VERSION, "box": box, "scale": scale,
+                   "columns": len(table_grid(rows)[0]), "profile": "table-columns-v1"}
+        key = hashlib.sha256(json.dumps(profile, sort_keys=True).encode()).hexdigest()
+        cache = cache_dir / f"table-cpu-{key}.json"
+        cached = None
+        if cache.is_file():
+            try:
+                candidate = json.loads(cache.read_text(encoding="utf-8"))
+                if candidate.get("identity") == profile: cached = candidate
+            except (ValueError, OSError): pass
+        bitmap = page.render(scale=scale, crop=(left, bottom, width-right, height-top), draw_annots=False)
+        image = bitmap.to_pil()
+        try:
+            lines = cached["lines"] if cached else _recognize(image)
+            verification = verify_table_text(rows, lines)
+            method = "whole table"
+            if not verification["accepted"]:
+                bounds = table_column_bounds(rows, lines, image)
+                column_lines = cached.get("column_lines", []) if cached else []
+                if not column_lines:
+                    for column, (start, end) in enumerate(bounds):
+                        crop = image.crop((start, 0, end, image.height))
+                        try:
+                            column_lines.extend({**line, "column": column} for line in _recognize(crop))
+                        finally: crop.close()
+                if column_lines:
+                    candidate = verify_table_text(rows, column_lines)
+                    if candidate["accepted"] or candidate["word_support"] > verification["word_support"]:
+                        verification, method = candidate, "separate columns"
+                cached = {"identity": profile, "lines": lines, "column_lines": column_lines, "bounds": bounds}
+            else:
+                cached = {"identity": profile, "lines": lines}
+            cache.write_text(json.dumps(cached, ensure_ascii=False), encoding="utf-8")
+            verification.update(scale=scale, method=method, independent_ocr_profile=OCR_VERSION)
+            attempts.append(verification)
+            if verification["accepted"]: return verification
+        finally:
+            image.close(); bitmap.close()
+    result = max(attempts, key=lambda attempt: (not attempt["missing_numbers"], attempt["word_support"]))
+    result["attempts"] = [dict(attempt) for attempt in attempts]
+    return result
+
+
 def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: str,
                     url: str, expected_digest: str = "", timeout: int = 300, requester=None) -> dict:
     """Refine OCR prose and supply semantic equation text to text-only models.
@@ -162,10 +218,11 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
     digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:12]
     cache_dir = output_dir / ".vision-cache" / digest
     cache_dir.mkdir(parents=True, exist_ok=True)
-    details, math_text, sources = [], {}, []
+    details, math_text, sources, table_text = [], {}, [], {}
 
     def recognize(page, box, mode, scale):
         key_data = {**identity, "box": box, "page": page_number, "mode": mode, "scale": scale}
+        if mode == "Table": key_data["table_profile"] = "borderless-crop-v1"
         key = hashlib.sha256(json.dumps(key_data, sort_keys=True).encode()).hexdigest()
         cache = cache_dir / (key + ".json")
         if cache.exists():
@@ -178,22 +235,25 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
         width, height = page.get_size(); l,b,r,t = box
         padding = .7 if mode == "Text" else 0
         bitmap = page.render(scale=scale, crop=(max(0,l-padding),max(0,b-padding),max(0,width-r-padding),max(0,height-t-padding)), draw_annots=False)
-        image = bitmap.to_pil(); bordered = ImageOps.expand(image, border=12, fill="white"); buffer = BytesIO()
+        image = bitmap.to_pil(); bordered = ImageOps.expand(image, border=0 if mode == "Table" else 12, fill="white"); buffer = BytesIO()
         bordered.save(buffer, format="PNG"); bordered.close(); image.close(); bitmap.close()
         result = request(url, "/api/generate", {
             "model": name, "prompt": mode + " Recognition:", "images": [base64.b64encode(buffer.getvalue()).decode()],
             "stream": False, "keep_alive": "5m",
             "options": {"temperature": 0, "seed": 0, "num_predict": 4096, "num_ctx": 8192},
         }, timeout=timeout)
-        text = result.get("response", "").strip()
+        if not isinstance(result, dict) or not isinstance(result.get("response"), str):
+            raise _RegionTranscriptionError("Vision OCR returned an invalid transcription.")
+        text = result["response"].strip()
         if not text or result.get("done_reason") != "stop":
-            raise VisionOcrError("Vision OCR returned an empty or truncated transcription; source retained. Increase the token limit or use a smaller region.")
+            raise _RegionTranscriptionError("Vision OCR returned an empty or truncated transcription.")
         temporary = cache.with_suffix(".tmp")
         temporary.write_text(json.dumps({"identity": key_data, "text": text}, ensure_ascii=False), encoding="utf-8")
         temporary.replace(cache)
         return text
 
     from .math_markup import valid_math
+    from .ocr import OcrError
     nodes = list(_nodes(document))
     with _PDFIUM_LOCK, pdfium.PdfDocument(pdf_path) as pdf:
         for page_number in range(1, len(pdf)+1):
@@ -212,7 +272,12 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
                     # exponents. Refine prose even if RapidOCR's score is high.
                     if ((node.get("font") == "OCR" and (len(original.split()) >= 7 or box[2]-box[0] > page.get_size()[0]*.35))
                             or (node.get("formula snapshot") and len(re.findall(r"\b[A-Za-z]{3,}\b", original)) >= 4)):
-                        candidate = recognize(page, box, "Text", 4)
+                        try:
+                            candidate = recognize(page, box, "Text", 4)
+                        except _RegionTranscriptionError as exc:
+                            details.append({"page": page_number, "kind": "prose", "accepted": False,
+                                            "box": box, "reason": f"{exc} Source retained.", "original": original})
+                            continue
                         accepted = _prose_agrees(original, candidate) and valid_math(candidate)
                         reason = "prose and numeric checks passed" if accepted else "source disagreement; original retained"
                         second = ""
@@ -220,7 +285,10 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
                                              and len(re.findall(r"\b[A-Za-z]{3,}\b", original)) >= 4
                                              and Counter(re.findall(r"\d+(?:\.\d+)?", original)) != Counter(re.findall(r"\d+(?:\.\d+)?", candidate)))
                         if not accepted and valid_math(candidate) and not protected_numbers:
-                            second = recognize(page, box, "Text", 6)
+                            try:
+                                second = recognize(page, box, "Text", 6)
+                            except _RegionTranscriptionError:
+                                second = ""
                             accepted = valid_math(second) and _prose_consistent(candidate, second)
                             if accepted:
                                 reason = "two resolutions agree; original OCR disagreed"
@@ -251,46 +319,80 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
                         continue
                     box = asset["bounding box"]
                     local = [span for span in page_spans if _inside(span.box, box, padding=0)]
+                    if expression := native_expression(page, box):
+                        math_text[asset["source"]] = expression
+                        details.append({"page": page_number, "kind": "formula", "source": asset["source"],
+                                        "accepted": True, "reason": "source Unicode and character geometry", "first": expression})
+                        continue
                     textpage = page.get_textpage()
                     try:
                         native = textpage.get_text_bounded(*box).strip()
-                        # Word spans may contain both a base and its subscript.
-                        # Inspect the original character sizes before trusting
-                        # native plain text such as `qz` as a flat expression.
-                        sizes = [pdfium.raw.FPDFText_GetFontSize(textpage, index)
-                                 for span in local for index in range(span.index, min(textpage.count_chars(), span.index+len(span.text)))
-                                 if pdfium.raw.FPDFText_GetUnicode(textpage,index)>32]
-                        uniform = bool(sizes) and min(sizes) >= max(sizes)*.9
+                        native_mapping_valid = True
+                        for index in range(textpage.count_chars()):
+                            bounds = textpage.get_charbox(index)
+                            if _area(bounds) and _inside(bounds, box, padding=0):
+                                if (pdfium.raw.FPDFText_HasUnicodeMapError(textpage, index) != 0
+                                        or pdfium.raw.FPDFText_GetUnicode(textpage, index) == 0):
+                                    native_mapping_valid = False
+                                    break
                     finally: textpage.close()
-                    # A decoded, single-line expression with a uniform baseline
-                    # is stronger evidence than a model guess (e.g. `p > q`).
-                    if (local and uniform and all(span.font_name for span in local) and "\n" not in native
-                            and not re.search(r"[\ue000-\uf8ff\ufffd\x00-\x08]", native)
-                            and min(span.font_size for span in local) >= max(span.font_size for span in local)*.9
-                            and max(span.baseline for span in local)-min(span.baseline for span in local) < 1
-                            and re.fullmatch(r"[A-Za-z0-9\s+*/=<>.,−-]+", native)):
-                        math_text[asset["source"]] = native
-                        details.append({"page":page_number,"kind":"formula","source":asset["source"],
-                                        "accepted":True,"reason":"uniform-baseline native Unicode","first":native})
+                    try:
+                        first = _strip_math_fence(recognize(page, box, "Formula", 4))
+                        second = _strip_math_fence(recognize(page, box, "Formula", 6))
+                        escalation = ""
+                        if _math_key(first) != _math_key(second):
+                            third = _strip_math_fence(recognize(page, box, "Formula", 8))
+                            if _math_key(second) == _math_key(third):
+                                first, second = second, third
+                                escalation = " (6x/8x retry)"
+                    except _RegionTranscriptionError as exc:
+                        details.append({"page": page_number, "kind": "formula", "source": asset["source"],
+                                        "accepted": False, "reason": f"{exc} Source image retained."})
                         continue
-                    first = _strip_math_fence(recognize(page, box, "Formula", 4))
-                    second = _strip_math_fence(recognize(page, box, "Formula", 6))
-                    escalation = ""
-                    if _math_key(first) != _math_key(second):
-                        third = _strip_math_fence(recognize(page, box, "Formula", 8))
-                        if _math_key(second) == _math_key(third):
-                            first, second = second, third
-                            escalation = " (6x/8x retry)"
                     accepted = _math_key(first) == _math_key(second) and valid_math("$$"+first+"$$")
-                    native_agrees = not local or not all(span.font_name for span in local) or (
-                        _latin_operands(native) == _latin_operands(first, latex=True))
+                    native_available = bool(local) and all(span.font_name for span in local) and native_mapping_valid
+                    native_agrees = not native_available or _latin_operands(native) == _latin_operands(first, latex=True)
                     accepted = accepted and native_agrees
                     details.append({"page": page_number, "kind": "formula", "source": asset["source"],
                                     "accepted": accepted, "first": first, "second": second,
                                     "native_operands_agree": native_agrees,
-                                    "reason": "two resolutions and native operands agree" + escalation if accepted else "transcriptions or native operands disagree; image retained"})
+                                    "native_operands_available": native_available,
+                                    "reason": (("two resolutions and native operands agree" if native_available else
+                                                "two resolutions agree; native operands unavailable") + escalation
+                                               if accepted else "transcriptions or native operands disagree; image retained")})
                     if accepted:
                         math_text[asset["source"]] = first
+                for asset in document.get("figures", []):
+                    if asset["page number"] != page_number or asset.get("asset kind") != "table": continue
+                    detail = {"page": page_number, "kind": "table", "source": asset["source"], "accepted": False}
+                    try:
+                        candidates, failures, first = [], [], None
+                        for scale in (3, 4.5, 6):
+                            try:
+                                candidate = parse_table(recognize(page, asset["bounding box"], "Table", scale))
+                            except TableError as exc:
+                                failures.append(str(exc)); continue
+                            first = next((prior for prior in candidates if tables_agree(prior, candidate)), None)
+                            if first is not None: break
+                            candidates.append(candidate)
+                        if first is None:
+                            raise TableError("Table cells or structure were not confirmed at two resolutions. " + "; ".join(failures))
+                        if not all(valid_math(cell["text"]) for row in first for cell in row):
+                            raise TableError("Table transcription contains invalid equation markup.")
+                        verification = _verify_table_image(page, asset["bounding box"], first, cache_dir, identity)
+                        detail.update(accepted=verification["accepted"], verification=verification,
+                                      shape=[len(table_grid(first)), len(table_grid(first)[0])],
+                                      reason="rendering resolutions and independent OCR agree" if verification["accepted"]
+                                      else "independent OCR did not confirm table text or numbers; source image retained")
+                        if verification["accepted"]:
+                            table_text[asset["source"]] = {"rows": first, "verification": verification}
+                    except (TableError, VisionOcrError) as exc:
+                        detail["reason"] = str(exc) + "; source image retained"
+                    except ImportError:
+                        detail["reason"] = 'Independent CPU OCR is unavailable. Install ".[ocr]" to verify table transcriptions; source image retained.'
+                    except OcrError as exc:
+                        detail["reason"] = f"Independent CPU OCR is unavailable: {exc}; source image retained"
+                    details.append(detail)
             finally:
                 page.close()
     # Repeated short notation provides another independent observation. Only
@@ -317,6 +419,7 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
             if template:template[0].close()
     document["vision ocr"] = {**identity, "source_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(), "regions": details}
     document["math transcriptions"] = {source:_semantic_latex(text) for source,text in math_text.items()}
+    document["table transcriptions"] = table_text
     document["vision sources"] = sources
     active = {image_reference(match).source for node in nodes if not node.get("suppressed")
               for text in (node.get("content", ""), node.get("formula snapshot", ""))

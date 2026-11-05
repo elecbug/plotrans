@@ -25,7 +25,17 @@ def main() -> None:
     else:
         st.info("Generate original HTML, Markdown, and ZIP without translation or summaries. Default settings work without Ollama.")
     uploaded = st.file_uploader("Choose a paper PDF", type="pdf")
-    with st.expander("Settings", expanded=False):
+    vision_choice = st.selectbox(
+        "High quality document OCR", ["Disabled", DEFAULT_VISION_MODEL, "Custom model"],
+        key="document_ocr_choice",
+        help="Optionally transcribe tables and verify equations or OCR text with a local model. Installation is checked when processing starts.",
+    )
+    vision_model = ""
+    if vision_choice == "Custom model":
+        vision_model = st.text_input("OCR model name", placeholder=f"Example: {DEFAULT_VISION_MODEL}").strip()
+    elif vision_choice != "Disabled":
+        vision_model = vision_choice
+    with st.expander("Settings", expanded=False, key="processing_settings"):
         if translate:
             translation_model = st.text_input("Translation model", TRANSLATION_MODEL)
             summary_model = st.text_input("Summary model", SUMMARY_MODEL)
@@ -34,15 +44,6 @@ def main() -> None:
         ocr_mode = st.selectbox("OCR mode", ["auto", "off", "force"],
                                 help="auto: detect scans and unreadable text; off: disable OCR; force: process every nonblank page")
         ocr_dpi = st.slider("OCR resolution (DPI)", 96, 400, 216, 8)
-        vision_choice = st.selectbox(
-            "High quality document OCR", ["Disabled", DEFAULT_VISION_MODEL, "Custom model"],
-            help="Optionally verify equations and OCR text with a local model. Installation is checked when processing starts.",
-        )
-        vision_model = ""
-        if vision_choice == "Custom model":
-            vision_model = st.text_input("OCR model name", placeholder=f"Example: {DEFAULT_VISION_MODEL}").strip()
-        elif vision_choice != "Disabled":
-            vision_model = vision_choice
         ollama_url = OLLAMA_URL
         if translate or vision_choice != "Disabled":
             ollama_url = st.text_input("Ollama URL", OLLAMA_URL)
@@ -104,13 +105,13 @@ def main() -> None:
         if "bundle" in st.session_state:
             st.download_button("Download paper ZIP", st.session_state["bundle"],
                                file_name=Path(st.session_state["filename"]).stem + ".zip",
-                               mime="application/zip")
+                               mime="application/zip", on_click="ignore")
         st.download_button("Download Markdown", st.session_state["markdown"],
-                           file_name=st.session_state["filename"], mime="text/markdown")
+                           file_name=st.session_state["filename"], mime="text/markdown", on_click="ignore")
         if "html" in st.session_state:
             st.download_button("Download HTML", st.session_state["html"],
                                file_name=Path(st.session_state["filename"]).with_suffix(".html").name,
-                               mime="text/html")
+                               mime="text/html", on_click="ignore")
         st.caption("Use the ZIP to move the document to another computer with its CSS and images.")
         with st.expander("HTML preview", expanded=True):
             html_path = Path(st.session_state["result_path"]).with_suffix(".html")

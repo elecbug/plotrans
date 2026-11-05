@@ -18,7 +18,7 @@ from .figures import _PDFIUM_LOCK, _area, _intersection, _nodes, _union
 from .markup import FIGURE_LINK, image_reference, inline_image_tag
 
 
-_MATH_FONT = re.compile(r"(?:CMMI|CMSY|CMEX|MSAM|MSBM|Symbol|Math)", re.I)
+_MATH_FONT = re.compile(r"(?:CMMI|CMSY|CMEX|MSAM|MSBM|MTSYN|Symbol|Math)", re.I)
 Box = tuple[float, float, float, float]
 
 
@@ -71,7 +71,7 @@ def _spans(page) -> list[TextSpan]:
             box = first.box
             for span in pending[1:]: box = _union(box, span.box)
             seed = any(span.math for span in pending) or text in {"=", "+", "≤", "≥", "∑", "∫", "√", "±", "×"}
-            seed = seed or (len(text) == 1 and text.isalpha() and bool(re.search("Italic|Oblique", first.font_name, re.I)))
+            seed = seed or (len(text) == 1 and text.isalpha() and bool(re.search("Italic|Oblique|It$", first.font_name, re.I)))
             # Operators in a monospaced program are source code, not formula
             # seeds. Cropping `p =` out of a C declaration destroys the program.
             if re.search(r"Courier|Mono|Consolas", first.font_name, re.I):
@@ -108,7 +108,9 @@ def _spans(page) -> list[TextSpan]:
             if decimal: kind = "number"
             reference_size = max(8, size)
             separated = pending and (abs(baseline - pending[-1].baseline) > reference_size * 0.5
-                                      or box[0] - pending[-1].box[2] > reference_size * 0.5)
+                                      or box[0] - pending[-1].box[2] > reference_size * 0.5
+                                      or font != pending[-1].font_name
+                                      or abs(size - pending[-1].font_size) > max(size, pending[-1].font_size) * .1)
             if category != kind or kind not in {"word", "number"} or separated: flush()
             category = kind
             pending.append(TextSpan(index, text, box, undecodable, size, baseline, font))
@@ -124,6 +126,15 @@ _FUNCTIONS = {"O", "log", "ln", "exp", "sin", "cos", "tan", "min", "max", "Pr", 
 def _expand_expressions(spans: list[TextSpan]) -> list[TextSpan]:
     """Include readable operators, digits, brackets and identifiers in one crop."""
     identifiers: set[int] = set()
+    citations: set[int] = set()
+    for index in range(1, len(spans) - 2):
+        opening, number, closing = spans[index:index + 3]
+        # A separated numeric reference after an expression is prose. Keep a
+        # tightly attached array index such as A[2] with its mathematical base.
+        if (opening.text == "[" and number.text.isdigit() and closing.text == "]"
+                and opening.box[0] - spans[index - 1].box[2] > opening.font_size * .3
+                and not any(_MATH_FONT.search(s.font_name) for s in (opening, number, closing))):
+            citations.update(s.index for s in (opening, number, closing))
     prose = {"and", "or", "is", "where", "with", "for", "the", "a", "an", "if", "then", "else", "return", "while"}
     for index, span in enumerate(spans):
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", span.text) or span.text.lower() in prose: continue
@@ -140,11 +151,13 @@ def _expand_expressions(spans: list[TextSpan]) -> list[TextSpan]:
             gap = spans[index + 1].box[0] - span.box[2]
             if gap <= max(8, span.font_size) * 0.25: identifiers.add(span.index)
     def candidate(span: TextSpan) -> bool:
+        if span.index in citations:
+            return False
         text = span.text
         return (span.math or span.index in identifiers or text in _FUNCTIONS or text.replace(".", "").isdigit()
                 or (len(text) == 1 and text.isalpha())
-                or (text.isalpha() and bool(re.search("Italic|Oblique", span.font_name, re.I)))
-                or all(char in "+-=*/^_()[]{}<>|,:;≤≥≈≠∞·×÷∈∉∪∩…" for char in text)
+                or (text.isalpha() and bool(re.search("Italic|Oblique|It$", span.font_name, re.I)))
+                or all(char in "+-=–*/^_()[]{}<>|,:;≤≥≈≠∞·×÷∈∉∪∩…" for char in text)
                 or text == "...")
 
     def connected(a: TextSpan, b: TextSpan) -> bool:
@@ -213,6 +226,17 @@ def _groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
             group = sorted(merged.pop(touching) + group, key=lambda s: s.index)
             box = _group_box(group)
         merged.append(group)
+    # Italic overhangs can put a following comma/period inside the padded crop.
+    # Give that punctuation an explicit owner and remove its duplicate text.
+    owned = {span.index for group in merged for span in group}
+    for group in merged:
+        box = _group_box(group)
+        baseline = group[-1].baseline
+        punctuation = [span for span in spans if span.index not in owned and span.text in {".", ",", ";", ":"}
+                       and -.5 <= span.box[0]-box[2] <= .4 and abs(span.baseline-baseline) < 1]
+        if punctuation:
+            span = min(punctuation, key=lambda item: item.box[0])
+            group.append(span); owned.add(span.index)
     return sorted(merged, key=lambda group: group[0].index)
 
 
@@ -221,6 +245,30 @@ def _group_box(group: list[TextSpan]) -> Box:
     for span in group[1:]:
         box = _union(box, span.box)
     return box
+
+
+def _plain_text_group(group: list[TextSpan], node: dict) -> bool:
+    """Decoded list markers, heading labels, and prose tokens need no crop."""
+    text = "".join(span.text for span in group)
+    content = node.get("content", "").lstrip()
+    if text in {"•", "◦", "▪", "‣"} and content.startswith(text):
+        return True
+    if any(not span.font_name or _MATH_FONT.search(span.font_name) for span in group):
+        return False
+    if node.get("type") == "heading" and (label := re.match(r"([A-Z])\.\s", content)):
+        if text in {label[1], label[1] + "."}:
+            return True
+    sizes = [span.font_size for span in group]
+    baselines = [span.baseline for span in group]
+    if min(sizes) < max(sizes) * .95 or max(baselines) - min(baselines) > max(sizes) * .12:
+        return False
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9.]*", text):
+        return False
+    # Italic P2P and version names can be split into letter/number spans by
+    # PDFium. A uniform baseline provides no evidence of a sub/superscript.
+    if sum(char.isalpha() for char in text) >= 2 and any(char.isdigit() for char in text):
+        return True
+    return bool(re.match(r"\[\d+\]", content) and re.fullmatch(r"[A-Z]\.", text))
 
 
 def _inline_metrics(group: list[TextSpan], spans: list[TextSpan], node: dict) -> tuple[float, float]:
@@ -247,9 +295,10 @@ def _insertions(content: str, spans: list[TextSpan], groups: list[list[TextSpan]
     """
     source = ""
     positions: dict[int, int] = {}
+    owned_math = {span.index for group in groups for span in group}
     for span in spans:
         positions[span.index] = len(source)
-        if not span.math:
+        if span.index not in owned_math:
             source += _canonical(span.text)[0]
     target, offsets = _canonical(content)
     if not source or not target:
@@ -272,7 +321,8 @@ def _insertions(content: str, spans: list[TextSpan], groups: list[list[TextSpan]
         math_length = sum(len(_canonical(span.text)[0]) for span in group)
         math_words = set(re.findall(r"[A-Za-z]{3,}", " ".join(span.text for span in group).lower()))
         removed_words = set(re.findall(r"[A-Za-z]{3,}", removed.lower()))
-        if len(removed) > max(32, math_length * 2 + 4) or not removed_words.issubset(math_words):
+        exact_native = _canonical(removed)[0] == _canonical("".join(span.text for span in group))[0]
+        if len(removed) > max(32, math_length * 2 + 4) or not (exact_native or removed_words.issubset(math_words)):
             return None
         ranges.append((start, end))
     if any(a[1] > b[0] for a, b in zip(ranges, ranges[1:])):
@@ -477,6 +527,12 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 assignments: dict[int, list[TextSpan]] = defaultdict(list)
                 unassigned: list[TextSpan] = []
                 nodes = [node for node in nodes if node.get("content", "").strip()]
+                plain_ids = set()
+                for group in _groups(spans):
+                    if any(_inside(_group_box(group), _box(node), padding=.5)
+                           and _plain_text_group(group, node) for node in nodes):
+                        plain_ids.update(span.index for span in group)
+                spans = [replace(span, math=False) if span.index in plain_ids else span for span in spans]
                 for group in _groups(spans):
                     group_box = _group_box(group)
                     candidates = []
@@ -546,7 +602,8 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     edits = [(start, end, save(_group_box(group), metrics=_inline_metrics(group, selected, node)))
                              for (start, end), group in zip(ranges, groups, strict=True)]
                     for start, end, image in reversed(edits):
-                        if end < len(content) and content[end].isalnum():
+                        if end < len(content) and (content[end].isalnum()
+                                or (end > start and content[end - 1].isspace())):
                             image += " "
                         content = content[:start] + image + content[end:]
                     node["content"] = content

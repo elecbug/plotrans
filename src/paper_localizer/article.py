@@ -13,6 +13,8 @@ from markdown_it import MarkdownIt
 
 from .markup import FIGURE_LINK, image_reference, inline_image_tag
 from .math_markup import LATEX, expression, mathml, render_math
+from .tables import table_html
+from .source_links import assign_source_links, web_target
 
 
 _MARKDOWN = MarkdownIt("commonmark", {"html": True}).enable("table")
@@ -29,6 +31,10 @@ class Unit:
     pages: tuple[int, ...] = ()
     caption: Unit | None = None
     anchor: str = ""
+    paragraph_id: str = ""
+    table_data: dict | None = None
+    links: list[dict] = field(default_factory=list)
+    image_size: tuple[int, ...] = ()
 
 
 @dataclass
@@ -48,6 +54,7 @@ class Article:
     author: str = ""
     front: list[Unit] = field(default_factory=list)
     abstract: list[Unit] = field(default_factory=list)
+    keywords: list[Unit] = field(default_factory=list)
     sections: list[Section] = field(default_factory=list)
     summary: str = ""
     translated: bool = False
@@ -55,6 +62,8 @@ class Article:
     warnings: list[str] = field(default_factory=list)
     ocr_sources: list[dict] = field(default_factory=list)
     vision_sources: list[dict] = field(default_factory=list)
+    identifiers: list[dict] = field(default_factory=list)
+    source_links: list[dict] = field(default_factory=list)
 
 
 def _plain(text: str) -> str:
@@ -94,14 +103,32 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
     pending_figure: Unit | None = None
     used = {"abstract", "summary", "full-text", "figures", "ocr-sources"}
     figure_count = 0
+    image_sizes = {asset["source"]: asset.get("pixel size", ()) for asset in document.get("figures", [])}
 
     def append(unit: Unit) -> None:
-        if abstract_mode: article.abstract.append(unit)
-        elif current: current.units.append(unit)
-        else: article.front.append(unit)
+        target = article.abstract if abstract_mode else current.units if current else article.front
+        previous = next((other for other in reversed(target)
+                         if unit.paragraph_id and other.paragraph_id == unit.paragraph_id), None)
+        if previous and unit.kind == previous.kind == "text":
+            previous.source += " " + unit.source
+            if unit.translation:
+                previous.translation = (previous.translation + " " + unit.translation).strip()
+            previous.pages = tuple(sorted(set(previous.pages + unit.pages)))
+        else:
+            target.append(unit)
 
     for index, chunk in enumerate(chunks):
         translated = translations[index] if translations is not None else ""
+        if chunk.kind == "frontmatter":
+            article.front.append(Unit(chunk.source, pages=chunk.pages))
+            pending_figure = None
+            continue
+        if chunk.kind == "keywords":
+            strip_label = lambda value: re.sub(r"^(?:index terms|keywords)\s*[:.\-—]?\s*", "", value, flags=re.I)
+            article.keywords.append(Unit(strip_label(chunk.source), strip_label(translated), pages=chunk.pages))
+            abstract_mode = False
+            pending_figure = None
+            continue
         if chunk.kind in {"caption", "caption-image"}:
             # A source-only caption crop has no machine translation. Showing
             # it in both columns would duplicate the image under a false label.
@@ -112,46 +139,55 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
                 append(unit)
             pending_figure = None
             continue
-        if chunk.kind in {"figure", "formula", "code"}:
+        if chunk.kind in {"figure", "table-image", "portrait", "formula", "code"}:
             if document.get("source image pages") and current is None:
                 current = Section("Source pages", "source-pages")
                 article.sections.append(current); abstract_mode = False
             unit = Unit(chunk.source, kind=chunk.kind, pages=chunk.pages)
-            if chunk.kind == "figure":
+            if image := next(FIGURE_LINK.finditer(chunk.source), None):
+                size = image_sizes.get(image_reference(image).source, ())
+                if len(size) == 2 and all(isinstance(value, int) and value > 0 for value in size):
+                    unit.image_size = tuple(size)
+            if chunk.kind == "table-image":
+                image = next(FIGURE_LINK.finditer(chunk.source), None)
+                if image:
+                    unit.table_data = document.get("table transcriptions", {}).get(image_reference(image).source)
+            if chunk.kind in {"figure", "table-image"}:
                 figure_count += 1; unit.anchor = f"figure-{figure_count}"
             append(unit)
-            pending_figure = unit if chunk.kind == "figure" else None
+            pending_figure = unit if chunk.kind in {"figure", "table-image"} else None
             continue
         source_parts = chunk.source.split("\n\n")
+        paragraph_ids = list(chunk.paragraph_ids) if chunk.paragraph_ids else [""] * len(source_parts)
         target_parts = translated.split("\n\n") if translated else []
         heading = _HEADING.match(source_parts[0])
         if heading:
             heading_text = heading.group(2)
             source_parts.pop(0)
+            paragraph_ids.pop(0)
             if target_parts and _HEADING.match(target_parts[0]): target_parts.pop(0)
             if _plain(heading_text).casefold() != _plain(title).casefold():
                 if _ABSTRACT.fullmatch(_plain(heading_text)):
                     abstract_mode = True
                 else:
-                    numbering = re.match(r"^(\d+(?:\.\d+)*)[.\s]", heading_text)
-                    level = min(4, 2 + numbering.group(1).count(".")) if numbering else 2
+                    level = max(2, min(4, len(heading.group(1))))
                     current = Section(heading_text, _slug(heading_text, used), level)
                     article.sections.append(current); abstract_mode = False
             else:
                 article.title_markup = heading_text
             pending_figure = None
         if target_parts and len(target_parts) != len(source_parts):
-            pairs = [("\n\n".join(source_parts), "\n\n".join(target_parts))]
+            pairs = [("\n\n".join(source_parts), "\n\n".join(target_parts), "")]
         else:
-            pairs = [(source, target_parts[i] if target_parts else "") for i, source in enumerate(source_parts)]
-        for source, target in pairs:
+            pairs = [(source, target_parts[i] if target_parts else "", paragraph_ids[i]) for i, source in enumerate(source_parts)]
+        for source, target, paragraph_id in pairs:
             if not source.strip(): continue
-            unit = Unit(source, target, pages=chunk.pages)
+            unit = Unit(source, target, pages=chunk.pages, paragraph_id=paragraph_id)
             if _ABSTRACT.match(source) and current is None:
                 abstract_mode = True
                 unit.source = _ABSTRACT.sub("", source, count=1)
                 unit.translation = _ABSTRACT.sub("", target, count=1)
-                article.abstract.append(unit)
+                append(unit)
             elif pending_figure and _CAPTION.match(source) and "\n\n" not in source:
                 unit.source = re.sub(r"^-\s+", "", source)
                 unit.translation = re.sub(r"^-\s+", "", target)
@@ -159,8 +195,9 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
             else:
                 append(unit)
             pending_figure = None
-    if not article.author and article.front:
-        article.author = article.front[0].source
+    units = article.front + article.abstract + article.keywords + [unit for section in article.sections for unit in section.units]
+    units += [unit.caption for unit in list(units) if unit.caption]
+    article.identifiers, article.source_links = assign_source_links(document.get("source links", []), units)
     return article
 
 
@@ -198,14 +235,41 @@ def _unit_markdown(unit: Unit) -> str:
     if unit.translation:
         text += "\n\n<details>\n<summary>Translation</summary>\n\n" + render_math(unit.translation) + "\n\n</details>"
     if unit.caption:
-        text += "\n\n" + _unit_markdown(unit.caption)
+        if unit.kind == "table-image":
+            text = _unit_markdown(unit.caption) + "\n\n" + text
+        else:
+            text += "\n\n" + _unit_markdown(unit.caption)
+    if unit.table_data:
+        text += "\n\n" + _table_transcription(unit)
+    if unit.links:
+        text += "\n\n" + _links_markdown(unit.links)
     return text
+
+
+def _links_markdown(links: list[dict]) -> str:
+    return " · ".join(f"[{link['label']}]({target})" for link in links if (target := web_target(link.get("url"))))
+
+
+def _links_html(links: list[dict]) -> str:
+    anchors = [f'<a href="{escape(target)}" target="_blank" rel="noopener noreferrer">{escape(link["label"])}</a>'
+               for link in links if (target := web_target(link.get("url")))]
+    return '<p class="source-links">' + " · ".join(anchors) + '</p>' if anchors else ""
+
+
+def _table_transcription(unit: Unit) -> str:
+    if not unit.table_data: return ""
+    return ('<details class="table-transcription"><summary>Searchable table transcription</summary>'
+            '<p>OCR transcription checked across rendering resolutions and against independent OCR. '
+            'The original image remains the reference for values and notation.</p>'
+            + table_html(unit.table_data["rows"], lambda value: _md_html(value, inline=True)) + '</details>')
 
 
 def article_markdown(article: Article) -> str:
     lines = [f"# {article.title_markup or article.title}", ""]
     if article.author: lines.extend([article.author, ""])
     lines.extend([f"- Source file: `{article.filename}`", f"- Pages: {article.pages}", ""])
+    if article.identifiers:
+        lines.extend(["Source identifiers: " + _links_markdown(article.identifiers), ""])
     for warning in article.warnings:
         lines.extend(["> Parsing note: " + warning, ""])
     if article.front:
@@ -215,6 +279,9 @@ def article_markdown(article: Article) -> str:
     if article.abstract:
         lines.extend(["## Abstract", ""])
         lines.extend(_unit_markdown(unit) + "\n" for unit in article.abstract)
+    if article.keywords:
+        lines.extend(["## Index terms", ""])
+        lines.extend(_unit_markdown(unit) + "\n" for unit in article.keywords)
     if article.summary: lines.extend(["## Article summary", "", article.summary, ""])
     if article.sections:
         lines.extend(["## Contents", ""])
@@ -233,24 +300,39 @@ def article_markdown(article: Article) -> str:
         for source in article.vision_sources:
             lines.extend([f"![Source region p.{source['page']}]({source['source']})", ""])
         lines.extend(["</details>", ""])
+    if article.source_links:
+        lines.extend(["<details>", "<summary>Other links from the source PDF</summary>", ""])
+        for link in article.source_links:
+            lines.extend([f"- [{link['url']}]({link['url']}) · p." + ", ".join(map(str, link.get("pages", []))), ""])
+        lines.extend(["</details>", ""])
     lines.extend(["---", "", "Extracted from the source PDF. Equation images preserve the original notation.", ""])
     return "\n".join(lines)
 
 
 def _unit_html(unit: Unit) -> str:
     pages = ", ".join(map(str, unit.pages))
+    dimensions = f' width="{unit.image_size[0]}" height="{unit.image_size[1]}"' if unit.image_size else ""
     if unit.kind == "code":
         source = re.sub(r"^```[^\n]*\n|\n```$", "", unit.source)
         return '<pre><code>' + escape(source) + f'</code></pre><span class="page-reference">p.{pages}</span>'
-    if unit.kind == "figure":
+    if unit.kind == "portrait":
+        match = next(FIGURE_LINK.finditer(unit.source), None)
+        if not match: return ""
+        ref = image_reference(match)
+        return (f'<figure class="author-portrait"><a href="{escape(ref.source)}" target="_blank" rel="noopener">'
+                f'<img src="{escape(ref.source)}" alt="{escape(ref.alt)}"{dimensions} loading="lazy"></a></figure>')
+    if unit.kind in {"figure", "table-image"}:
         match = next(FIGURE_LINK.finditer(unit.source), None)
         if not match: return ""
         ref = image_reference(match)
         caption = _pair_html(unit.caption, caption=True) if unit.caption else f"<span>Fig. · p.{pages}</span>"
-        return (f'<figure class="paper-figure" id="{unit.anchor}"><a href="{escape(ref.source)}" target="_blank" '
-                f'rel="noopener"><img src="{escape(ref.source)}" alt="{escape(ref.alt)}" loading="lazy"></a>'
-                f'<figcaption>{caption}</figcaption><a class="figure-open" href="{escape(ref.source)}" '
-                f'target="_blank" rel="noopener">View full size ↗</a></figure>')
+        label = f'<figcaption>{caption}</figcaption>'
+        is_table = unit.kind == "table-image"
+        return (f'<figure class="paper-figure{ " paper-table" if is_table else ""}" id="{unit.anchor}">'
+                f'{label if is_table else ""}<a href="{escape(ref.source)}" target="_blank" '
+                f'rel="noopener"><img src="{escape(ref.source)}" alt="{escape(ref.alt)}"{dimensions} loading="lazy"></a>'
+                f'{"" if is_table else label}<a class="figure-open" href="{escape(ref.source)}" '
+                f'target="_blank" rel="noopener">View full size ↗</a>{_table_transcription(unit)}</figure>')
     if unit.kind == "formula":
         return '<div class="equation-block">' + _md_html(unit.source) + '</div>'
     return _pair_html(unit)
@@ -262,7 +344,7 @@ def _pair_html(unit: Unit, caption: bool = False) -> str:
     translated = _md_html(unit.translation, inline=caption) if unit.translation else ""
     target = f'<div class="translation">{translated}</div>' if translated else ""
     return (f'<div class="reading-pair{ " has-translation" if translated else ""}"><div class="source">{source}</div>'
-            f'{target}</div><span class="page-reference">p.{page}</span>')
+            f'{target}</div><span class="page-reference">p.{page}</span>' + _links_html(unit.links))
 
 
 def article_html(article: Article, markdown_name: str) -> str:
@@ -272,15 +354,17 @@ def article_html(article: Article, markdown_name: str) -> str:
     if article.summary: navigation.append('<a href="#summary">Article summary</a>')
     navigation.extend(f'<a class="depth-{section.level}" href="#{section.anchor}">{escape(_plain(section.title))}</a>'
                       for section in article.sections)
-    figures = [unit for section in article.sections for unit in section.units if unit.kind == "figure"]
+    figures = [unit for section in article.sections for unit in section.units if unit.kind in {"figure", "table-image"}]
     if figures:
-        navigation.append('<h3>Figures</h3>')
+        navigation.append('<h3>Figures and tables</h3>')
         for number, unit in enumerate(figures, 1):
             label = f"Fig. {number}"
             if unit.caption and (match := _CAPTION.match(unit.caption.source)): label = match.group(0).lstrip("- ")
             navigation.append(f'<a href="#{unit.anchor}">{escape(label)} · p.{unit.pages[0]}</a>')
     abstract = ('<section class="abstract-card" id="abstract"><h2>Abstract</h2>' +
                 "".join(_unit_html(unit) for unit in article.abstract) + '</section>') if article.abstract else ""
+    keywords = ('<section class="keywords"><h2>Index terms</h2>' +
+                "".join(_unit_html(unit) for unit in article.keywords) + '</section>') if article.keywords else ""
     summary = ('<section class="summary-card" id="summary"><h2>Article summary</h2>' + _md_html(article.summary) + '</section>') if article.summary else ""
     front = ('<details class="author-details"><summary>Authors and source information</summary>' +
              "".join(_unit_html(unit) for unit in article.front) + '</details>') if article.front else ""
@@ -299,6 +383,12 @@ def article_html(article: Article, markdown_name: str) -> str:
             body += (f'<figure><img src="{escape(source["source"])}" alt="Source region p.{source["page"]}" loading="lazy">'
                      f'<figcaption>Source page {source["page"]}</figcaption></figure>')
         body += '</details>'
+    if article.source_links:
+        body += '<details class="source-link-list"><summary>Other links from the source PDF</summary><ul>'
+        for link in article.source_links:
+            pages = ", ".join(map(str, link.get("pages", [])))
+            body += f'<li><a href="{escape(link["url"])}" target="_blank" rel="noopener noreferrer">{escape(link["url"])}</a> · p.{pages}</li>'
+        body += '</ul></details>'
     checked_source = "" if article.translated else "checked"
     checked_both = "checked" if article.translated else ""
     controls = ('<label for="view-source">Original</label><label for="view-translated">Translation</label>'
@@ -314,12 +404,12 @@ def article_html(article: Article, markdown_name: str) -> str:
 <div class="article-shell"><input class="view-input" type="radio" name="view" id="view-source" {checked_source}>
 <input class="view-input" type="radio" name="view" id="view-translated"><input class="view-input" type="radio" name="view" id="view-both" {checked_both}>
 <header class="article-header"><p class="eyebrow">RESEARCH ARTICLE · {article.pages} PAGES</p>
-<h1 id="article-title">{_md_html(article.title_markup or article.title, True)}</h1><div class="authors">{_md_html(article.author, True)}</div>
+<h1 id="article-title">{_md_html(article.title_markup or article.title, True)}</h1><div class="authors">{_md_html(article.author, True)}</div>{_links_html(article.identifiers)}
 <div class="document-meta"><span>{escape(article.filename)}</span><a href="{escape(markdown_name)}" download>Download Markdown ↓</a></div>
 <div class="article-toolbar"><nav>{''.join(top_links)}</nav>
 <div class="view-switch" aria-label="Reading view">{controls}</div></div></header>
 <div class="article-layout"><aside class="contents"><details open><summary>Document contents</summary><nav>{''.join(navigation)}</nav></details></aside>
-<main class="paper-body" id="full-text">{front}{abstract}{summary}{body}
+<main class="paper-body" id="full-text">{front}{abstract}{keywords}{summary}{body}
 <footer>A local reading edition extracted from the source PDF. Equation images preserve the original notation. Verify translations and summaries against the source.</footer>
 </main></div></div></body></html>'''
 
@@ -337,7 +427,8 @@ def write_article(document: dict, title: str, filename: str, chunks, translation
         temporary.write_text(text, encoding="utf-8"); temporary.replace(destination)
     ocr_report = output.with_suffix(".ocr.json")
     if vision := document.get("vision ocr"):
-        ocr_report.write_text(json.dumps({"vision": vision, "equations": document.get("math transcriptions", {})},
+        ocr_report.write_text(json.dumps({"vision": vision, "equations": document.get("math transcriptions", {}),
+                                         "tables": document.get("table transcriptions", {})},
                                         ensure_ascii=False, indent=2), encoding="utf-8")
     else:
         ocr_report.unlink(missing_ok=True)

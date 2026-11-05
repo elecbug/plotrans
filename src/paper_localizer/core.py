@@ -20,6 +20,8 @@ from .bundle import FIGURE_LINK
 from .article import build_article, article_markdown, write_article
 from .layout import bind_captions, prepare_layout
 from .ocr import OcrOptions, apply_ocr, preserve_ocr_regions
+from .structure import order_document, repair_structure
+from .source_links import read_source_links
 
 
 TRANSLATION_MODEL = "kaelri/hy-mt2:7b-q4_K_M"
@@ -38,6 +40,7 @@ class Block:
     text: str
     caption_target: str = ""
     source_pages: tuple[int, ...] = ()
+    paragraph_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -47,6 +50,7 @@ class Chunk:
     source: str
     kind: str = "text"
     caption_target: str = ""
+    paragraph_ids: tuple[str, ...] = ()
 
 
 def _descendant_text(node: dict) -> str:
@@ -82,6 +86,7 @@ def extract_blocks(document: dict) -> list[Block]:
     """Flatten reading-order JSON while retaining page references and tables."""
     blocks: list[Block] = []
     footnotes: list[Block] = []
+    front_matter: list[Block] = []
 
     def visit(node: dict, inherited_page: int = 1) -> None:
         kind = str(node.get("type", "")).lower()
@@ -95,11 +100,20 @@ def extract_blocks(document: dict) -> list[Block]:
             if content := node.get("content"):
                 footnotes.append(Block(page, "paragraph", content))
             return
+        if kind == "frontmatter":
+            if content := node.get("content"):
+                front_matter.append(Block(page, kind, content))
+            return
+        if kind == "keywords":
+            if content := node.get("content"):
+                blocks.append(Block(page, kind, content))
+            return
         if kind in {"image", "picture"}:
             source = node.get("source")
             if isinstance(source, str) and source.startswith("figs/"):
                 alt = str(node.get("alt", f"Fig. p.{page}")).replace("[", "").replace("]", "")
-                blocks.append(Block(page, "image", f"![{alt}]({source})"))
+                kind = {"table": "table-image", "portrait": "portrait"}.get(node.get("asset kind"), "image")
+                blocks.append(Block(page, kind, f"![{alt}]({source})"))
                 if caption := node.get("caption node"):
                     value = caption.get("formula snapshot") or caption.get("content", "")
                     if value:
@@ -127,9 +141,10 @@ def extract_blocks(document: dict) -> list[Block]:
                     blocks.append(Block(page, "paragraph", text[split:].strip()))
                     return
                 text = f"{'#' * level} {text}"
-            elif kind == "list item":
-                text = f"- {text}"
-            blocks.append(Block(page, kind, text))
+            elif kind == "list item" or re.match(r"^[•■▪‣◦]\s+", text):
+                if not re.match(r"^(?:\d+[.)]\s+|\[\d+\]\s+)", text):
+                    text = "- " + re.sub(r"^[-•■▪‣◦]\s*", "", text)
+            blocks.append(Block(page, kind, text, paragraph_id=node.get("paragraph id", "")))
         for key in ("kids", "list items"):
             for child in node.get(key, []):
                 if isinstance(child, dict):
@@ -148,10 +163,10 @@ def extract_blocks(document: dict) -> list[Block]:
                 and re.match(r"^[a-z]", block.text)
                 and not FIGURE_LINK.search(previous.text + block.text)):
             continued[-1] = Block(previous.page, "paragraph", previous.text + " " + block.text,
-                                  source_pages=previous_pages + (block.page,))
+                                  source_pages=previous_pages + (block.page,), paragraph_id=previous.paragraph_id)
         else:
             continued.append(block)
-    blocks = continued
+    blocks = front_matter + continued
     if footnotes:
         blocks.append(Block(footnotes[0].page, "heading", "## Notes"))
         blocks.extend(footnotes)
@@ -185,19 +200,22 @@ def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
         raise ValueError("limit must be at least 200 characters")
     chunks: list[Chunk] = []
     lines: list[str] = []
+    paragraph_ids: list[str] = []
     pages: set[int] = set()
     size = 0
 
     def flush() -> None:
-        nonlocal lines, pages, size
+        nonlocal lines, paragraph_ids, pages, size
         if lines:
-            chunks.append(Chunk(len(chunks) + 1, tuple(sorted(pages)), "\n\n".join(lines)))
-        lines, pages, size = [], set(), 0
+            chunks.append(Chunk(len(chunks) + 1, tuple(sorted(pages)), "\n\n".join(lines),
+                                paragraph_ids=tuple(paragraph_ids)))
+        lines, paragraph_ids, pages, size = [], [], set(), 0
 
-    for block in blocks:
+    for block_number, block in enumerate(blocks, 1):
+        paragraph_id = block.paragraph_id or f"block-{block_number}"
         if block.kind == "heading" or re.match(r"^(?:Abstract|초록)\s*[.:：]", block.text, re.I):
             flush()
-        if block.kind in {"image", "formula", "caption", "caption-image", "code"}:
+        if block.kind in {"image", "table-image", "portrait", "formula", "caption", "caption-image", "code", "frontmatter", "keywords"}:
             flush()
             kind = "figure" if block.kind == "image" else block.kind
             chunks.append(Chunk(len(chunks) + 1, (block.page,), block.text, kind, block.caption_target))
@@ -205,7 +223,7 @@ def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
         if len(block.source_pages) > 1:
             flush()
             for part in _split_text(block.text, limit):
-                chunks.append(Chunk(len(chunks)+1, block.source_pages, part))
+                chunks.append(Chunk(len(chunks)+1, block.source_pages, part, paragraph_ids=(paragraph_id,)))
             continue
         for part in _split_text(block.text, limit):
             part_size = len(LATEX.sub("[[MATH_0001]]", FIGURE_LINK.sub("[[MATH_0001]]", part)))
@@ -216,6 +234,7 @@ def make_chunks(blocks: list[Block], limit: int = 1800) -> list[Chunk]:
             if size + part_size + 2 > limit:
                 flush()
             lines.append(part)
+            paragraph_ids.append(paragraph_id)
             pages.add(block.page)
             size += part_size + 2
     flush()
@@ -267,7 +286,9 @@ class OllamaClient:
 
 
 def prepare_document(pdf_path: Path, document: dict, output_dir: Path, *, ocr: OcrOptions | None = None) -> dict:
+    document["source links"] = read_source_links(pdf_path)
     document = apply_ocr(pdf_path, document, output_dir, ocr)
+    document = repair_structure(pdf_path, document)
     document = prepare_layout(document)
     document = preserve_ocr_regions(pdf_path, document, output_dir)
     document = attach_figures(pdf_path, document, output_dir)
@@ -276,7 +297,7 @@ def prepare_document(pdf_path: Path, document: dict, output_dir: Path, *, ocr: O
         from .vision import refine_document
         document = refine_document(pdf_path, document, output_dir,
                                   model=ocr.vision_model, url=ocr.vision_url, expected_digest=ocr.vision_digest)
-    return bind_captions(document)
+    return order_document(bind_captions(document))
 
 
 def parse_pdf(pdf_path: Path, output_dir: Path | None = None, *, ocr: OcrOptions | None = None) -> dict:
@@ -491,7 +512,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
             continue
         if progress:
             progress("Translating and summarizing", index, len(chunks))
-        if chunk.kind in {"figure", "formula", "caption-image", "code"}:
+        if chunk.kind in {"figure", "table-image", "portrait", "formula", "caption-image", "code", "frontmatter"}:
             translations.append(chunk.source)
             from .markup import image_reference
             equations = [document.get("math transcriptions", {}).get(image_reference(match).source)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import ctypes
+import math
 import re
 import threading
 from collections import defaultdict
@@ -49,9 +50,10 @@ def _node_box(node: dict, height: float) -> Box | None:
     return left, height - top, right, height - bottom
 
 
-def _connected_regions(mask: Image.Image, gap: int = 7) -> list[Box]:
+def _connected_regions(mask: Image.Image, gap: int = 7, *, min_width: int = 40,
+                       min_height: int = 18, min_ink: int = 30) -> list[Box]:
     """Find components in a graphics mask, joining nearby drawing fragments."""
-    expanded = mask.filter(ImageFilter.MaxFilter(gap * 2 + 1))
+    expanded = mask.copy() if gap == 0 else mask.filter(ImageFilter.MaxFilter(gap * 2 + 1))
     data = expanded.tobytes()
     width, height = expanded.size
     parents: list[int] = []
@@ -101,7 +103,7 @@ def _connected_regions(mask: Image.Image, gap: int = 7) -> list[Box]:
             candidate = (box[0] + tight[0], box[1] + tight[1],
                          box[0] + tight[2], box[1] + tight[3])
             w, h = candidate[2] - candidate[0], candidate[3] - candidate[1]
-            if w >= 40 and h >= 18 and tile.histogram()[255] >= 30:
+            if w >= min_width and h >= min_height and tile.histogram()[255] >= min_ink:
                 regions.append(candidate)
         tile.close()
     expanded.close()
@@ -116,6 +118,37 @@ def _horizontal_rules(mask: Image.Image, box: Box) -> bool:
     total = sum(counts)
     dense = sum(n for n in counts if n > width*.4)
     return bool(total and dense/total > .9 and sum(n > 0 for n in counts) < max(30, height*.3))
+
+
+def _repeated_margin_graphics(graphics) -> dict[int, list[Box]]:
+    """Find repeated margin artwork before it can be assigned to a caption.
+
+    Repetition and a short region confined to the page margin are both required;
+    an ordinary uncaptioned drawing in the body remains a real image.
+    """
+    candidates = defaultdict(list)
+    for index in range(len(graphics)):
+        page = graphics[index]
+        try:
+            width, height = page.get_size()
+            bitmap = page.render(scale=1, grayscale=True, draw_annots=False)
+            image = bitmap.to_pil()
+            mask = image.point(lambda value: 255 if value < 235 else 0).convert("L")
+            for box in _connected_regions(mask):
+                if box[3] - box[1] > height * .08: continue
+                side = "top" if box[3] < height * .09 else "bottom" if box[1] > height * .91 else ""
+                if not side: continue
+                key = side, round(box[0] / width * 20), round(box[2] / width * 20), round(box[1] / height * 20)
+                candidates[key].append((index + 1, box))
+            mask.close(); image.close(); bitmap.close()
+        finally:
+            page.close()
+    repeated = defaultdict(list)
+    minimum = max(3, math.ceil(len(graphics) * .3))
+    for items in candidates.values():
+        if len({number for number, _ in items}) >= minimum:
+            for number, box in items: repeated[number].append(box)
+    return repeated
 
 
 def _has_figure_caption(region: Box, nodes: list[dict], height: float) -> bool:
@@ -153,10 +186,11 @@ def _is_table(region: Box, nodes: list[dict], height: float) -> bool:
 def _include_labels(region: Box, nodes: list[dict], width: float, height: float) -> Box:
     result = region
     caption_boxes = [box for node in nodes
-                     if _FIGURE_CAPTION.match(str(node.get("content", "")).strip())
+                     if (node.get("type") == "caption" or _FIGURE_CAPTION.match(str(node.get("content", "")).strip()))
                      and (box := _node_box(node, height))]
     body_boxes = [box for node in nodes
                   if len(str(node.get("content", "")).split()) > 25
+                  and node.get("type") != "caption"
                   and not _FIGURE_CAPTION.match(str(node.get("content", "")).strip())
                   and (box := _node_box(node, height))]
     for node in nodes:
@@ -169,7 +203,7 @@ def _include_labels(region: Box, nodes: list[dict], width: float, height: float)
         if box[2] - box[0] > max(160, (region[2] - region[0]) * 1.6):
             continue
         vertical = box[3] - box[1] > (box[2] - box[0]) * 2.5 and box[2] - box[0] <= 20
-        if (len(text) > 120 or _FIGURE_CAPTION.match(text)
+        if (len(text) > 120 or _FIGURE_CAPTION.match(text) or node.get("type") == "caption"
                 or node.get("type") == "heading" or (box[3] - box[1] > 40 and not vertical)):
             continue
         if any(_intersection(box, caption) / max(_area(box), 1) > 0.5 for caption in caption_boxes):
@@ -189,6 +223,23 @@ def _include_labels(region: Box, nodes: list[dict], width: float, height: float)
         if region[3] <= caption[1] and caption[1] < bottom:
             bottom = max(region[3], caption[1] - 2)
     return (max(0, result[0] - 4), max(0, result[1] - 4), min(width, result[2] + 4), bottom)
+
+
+def _portrait_label(region: Box, nodes: list[dict], height: float) -> str:
+    width, tall = region[2] - region[0], region[3] - region[1]
+    if not tall or not .45 <= width / tall <= 1.2 or tall > height * .3:
+        return ""
+    for node in nodes:
+        text = node.get("content", "")
+        match = re.match(r"^([A-Z][A-Z.'’\-]+(?:\s+[A-Z][A-Z.'’\-]+){1,5})"
+                         r"(?:\s+\([^)]{1,50}\))?\s+(?:received|earned)\s+(?:the|a)\s+"
+                         r"(?:B\.?S\.?|M\.?S\.?|Ph\.?D\.?|bachelor|master|doctoral|degree)(?=\W|$)", text)
+        box = _node_box(node, height)
+        if not match or not box: continue
+        overlap = min(box[3], region[3]) - max(box[1], region[1])
+        if -5 <= box[0] - region[2] <= 25 and overlap > min(tall, box[3]-box[1]) * .5:
+            return match.group(1)
+    return ""
 
 
 def _text_labels(page) -> list[dict]:
@@ -281,6 +332,32 @@ def _merge_regions(regions: list[Box]) -> list[Box]:
     return merged
 
 
+def _include_graphic_fragments(regions: list[Box], fragments: list[Box],
+                               captions: list[dict], nodes: list[dict], height: float) -> list[Box]:
+    """Keep small detached drawing parts beside a captioned diagram.
+
+    Require the fragment's vertical extent to sit within the original drawing,
+    a nearby horizontal edge, and a bounded area change. Assign against the
+    original regions once so fragments cannot chain into neighboring drawings.
+    """
+    from .layout import caption_for_region
+    owners = [index for index, region in enumerate(regions)
+              if caption_for_region(region, captions, height, nodes)]
+    result = list(regions)
+    for fragment in fragments:
+        candidates = []
+        for index in owners:
+            region = regions[index]
+            gap = max(region[0] - fragment[2], fragment[0] - region[2], 0)
+            if (region[1] <= fragment[1] and fragment[3] <= region[3] and gap <= 20
+                    and _area(_union(region, fragment)) <= _area(region) * 1.25):
+                candidates.append((gap, abs((fragment[0]+fragment[2]) - (region[0]+region[2])), index))
+        if candidates:
+            index = min(candidates)[2]
+            result[index] = _union(result[index], fragment)
+    return result
+
+
 def _replace_figure_text(document: dict, figures: list[dict], heights: dict[int, float]) -> None:
     emitted: set[str] = set()
     by_page: dict[int, list[dict]] = defaultdict(list)
@@ -353,6 +430,8 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
     finally:
         writer.close()
     with _PDFIUM_LOCK, pdfium.PdfDocument(pdf_path) as original, pdfium.PdfDocument(buffer.getvalue()) as graphics:
+        repeated = _repeated_margin_graphics(graphics)
+        excluded = document.setdefault("excluded artwork", [])
         for index in range(len(original)):
             page_number = index + 1
             page, graphics_page = original[index], graphics[index]
@@ -360,6 +439,25 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 width, height = page.get_size()
                 heights[page_number] = height
                 nodes = page_nodes.get(page_number, [])
+
+                def furniture(region):
+                    repeated_margin = any(_intersection(region, box) / max(_area(region), 1) > .8
+                                          for box in repeated.get(page_number, []))
+                    title = document.get("title bounds")
+                    before_title = (page_number == 1 and title and region[3] < height - title[3] - 2
+                                    and region[3] - region[1] < height * .08)
+                    if repeated_margin or before_title:
+                        reason = "repeated margin artwork" if repeated_margin else "artwork above the article title"
+                        entry = {"page number": page_number,
+                                 "bounding box": [region[0], height-region[3], region[2], height-region[1]],
+                                 "reason": reason}
+                        if entry not in excluded: excluded.append(entry)
+                        return True
+                    return False
+
+                for node in nodes:
+                    if node.get("type") in {"image", "picture"} and (box := _node_box(node, height)) and furniture(box):
+                        node["suppressed"] = True
                 _refine_caption_tops(page,nodes)
                 bitmap = graphics_page.render(scale=1, grayscale=True, draw_annots=False)
                 image = bitmap.to_pil()
@@ -371,7 +469,11 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     draw = ImageDraw.Draw(mask)
                     for l,b,r,t in document.get("ocr line boxes",{}).get(str(page_number),[]):
                         draw.rectangle((max(0,l-1),max(0,height-t-1),min(width,r+1),min(height,height-b+1)),fill=0)
-                regions = _connected_regions(mask)
+                components = [region for region in _connected_regions(
+                    mask, min_width=3, min_height=3) if not furniture(region)]
+                regions = [region for region in components
+                           if region[2]-region[0] >= 40 and region[3]-region[1] >= 18]
+                fragments = [region for region in components if region not in regions]
                 rules = {r for r in regions if _horizontal_rules(mask, r)}
                 # A diagram's detached ID-space axis can look like a page
                 # separator. Retain it when it sits directly above a captioned
@@ -392,7 +494,7 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     for n in nodes)]
                 # Small raster images can fall below the graphics-component threshold.
                 for node in nodes:
-                    if node.get("type") in {"image", "picture"}:
+                    if node.get("type") in {"image", "picture"} and not node.get("suppressed"):
                         box = _node_box(node, height)
                         if page_number in document.get("ocr pages", []) and box and _area(box) > width*height*.65:
                             continue
@@ -409,6 +511,7 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 # column instead of joining everything that has nearby graphics.
                 from .layout import caption_for_region
                 captions = [n for n in nodes if n.get("type") == "caption"]
+                regions = _include_graphic_fragments(regions, fragments, captions, nodes, height)
                 expanded = []
                 for region in regions:
                     # A colored caption bullet can touch the figure's frame in
@@ -448,7 +551,7 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                                         and b[0] >= low and b[2] <= high]
                         region = _include_labels(region, local_labels, width, height)
                     else:
-                        region = _include_labels(region, labels, width, height)
+                        region = _include_labels(region, [] if _portrait_label(region, nodes, height) else labels, width, height)
                     expanded.append(region)
                 regions = _merge_regions(expanded)
                 grouped: dict[str, tuple[Box, dict | None]] = {}
@@ -467,13 +570,17 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     crop = (left, max(0, height - bottom), max(0, width - right), top)
                     bitmap = page.render(scale=2.5, crop=crop, draw_annots=False)
                     image = bitmap.to_pil()
+                    pixel_size = list(image.size)
                     image.save(destination)
                     image.close(); bitmap.close()
+                    portrait = _portrait_label(region, nodes, height) if not caption else ""
                     figures.append({
                         "type": "image", "page number": page_number,
                         "bounding box": [left, height - bottom, right, height - top],
                         "source": destination.relative_to(output_dir).as_posix(),
-                        "alt": f"Fig. p.{page_number}-{figure_index}",
+                        "pixel size": pixel_size,
+                        "alt": caption["caption label"] if caption else portrait or f"Image p.{page_number}-{figure_index}",
+                        "asset kind": "table" if caption and caption["caption label"].startswith("Table ") else "portrait" if portrait else "figure",
                         **({"caption label": caption["caption label"]} if caption else {}),
                     })
             finally:

@@ -11,7 +11,7 @@ from pypdf.generic import (DecodedStreamObject, DictionaryObject,
 
 from paper_localizer.bundle import build_bundle, figure_path
 from paper_localizer.core import extract_blocks, make_chunks, process_pdf
-from paper_localizer.figures import _text_labels, attach_figures
+from paper_localizer.figures import _connected_regions, _text_labels, attach_figures
 import pypdfium2 as pdfium
 
 
@@ -72,6 +72,42 @@ def make_fixture(path: Path) -> dict:
 
 
 class FigureTests(unittest.TestCase):
+    def test_zero_dilation_can_inspect_unclaimed_graphic_pixels(self):
+        mask = Image.new("L", (80, 60), 0)
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(mask)
+        draw.rectangle((5, 6, 10, 11), fill=255)
+        draw.rectangle((30, 40, 35, 45), fill=255)
+        self.assertEqual(_connected_regions(mask, gap=0, min_width=1, min_height=1),
+                         [(5, 6, 11, 12), (30, 40, 36, 46)])
+        mask.close()
+
+    def test_detached_small_vector_icon_stays_with_its_figure(self):
+        from test_structure import fixture_pdf
+        from paper_localizer.layout import prepare_layout
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); source = root / "detached-icon.pdf"
+            fixture_pdf(source, [
+                b"110 300 140 150 re S 340 300 140 150 re S "
+                b"q 0 0 1 rg 75 365 15 9 re f Q "
+                b"BT /F2 10 Tf 80 275 Td (Figure 1. Left diagram.) Tj ET "
+                b"BT /F2 10 Tf 330 275 Td (Figure 2. Right diagram.) Tj ET"])
+            document = {"kids": [
+                {"type": "caption", "content": "Figure 1. Left diagram.", "page number": 1,
+                 "bounding box": [80, 272, 280, 286]},
+                {"type": "caption", "content": "Figure 2. Right diagram.", "page number": 1,
+                 "bounding box": [330, 272, 530, 286]}]}
+            result = attach_figures(source, prepare_layout(document), root)
+            self.assertEqual(len(result["figures"]), 2)
+            left, right = sorted(result["figures"], key=lambda asset: asset["bounding box"][0])
+            self.assertLess(left["bounding box"][0], 75)
+            self.assertLess(left["bounding box"][2], 300)
+            self.assertGreater(right["bounding box"][0], 300)
+            with Image.open(root / left["source"]) as image:
+                blue = sum(b > r + 100 and b > g + 100
+                           for r, g, b in image.convert("RGB").get_flattened_data())
+                self.assertGreater(blue, 500)
+
     def test_form_xobject_legend_uses_transformed_page_coordinates(self):
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory); source = root/"transformed.pdf"

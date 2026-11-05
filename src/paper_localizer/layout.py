@@ -8,13 +8,22 @@ import re
 from .figures import _nodes, _union
 
 
-CAPTION = re.compile(r"^(?:[-•■▪‣]\s*)?(Fig(?:ure)?\.?|Table)\s*((?:[A-Z]\.)?\d+(?:\.\d+)*)(?:[.:]\s*|\s+)", re.I)
+CAPTION = re.compile(r"^(?:[-•■▪‣]\s*)?(Fig(?:ure)?\.?|Table)\s*((?:[A-Z]\.)?\d+(?:\.\d+)*)([.:]\s*|\s+)", re.I)
 _REFERENCE_VERBS = re.compile(r"^(?:shows?|illustrates?|depicts?|presents?|plots?|evaluates?|is|are|provides?|compares?|summarizes?)\b", re.I)
+
+
+def _font_family(name: str) -> str:
+    name = re.sub(r"^[A-Z]{6}\+", "", name)
+    return re.sub(r"(?:[-_, ]?(?:Bold|Italic|Oblique|Regular|Roman|Book|Medium|Semibold|Md|It|Reg|MT))+$",
+                  "", name, flags=re.I).casefold()
 
 
 def caption_label(text: str) -> str:
     match = CAPTION.match(text.strip())
     if not match or _REFERENCE_VERBS.match(text[match.end():].lstrip()):
+        return ""
+    remainder = text[match.end():].lstrip()
+    if match.group(3).isspace() and remainder and remainder[0].islower():
         return ""
     return ("Table " if match.group(1).lower() == "table" else "Fig. ") + match.group(2)
 
@@ -55,7 +64,8 @@ def prepare_layout(document: dict) -> dict:
                         continue
                     if re.match(r"^(?:\d+(?:\.\d+)*[. ]|[IVX]+\. )", other["content"]):
                         continue
-                    if node.get("font") and other.get("font") != node.get("font"):
+                    if (node.get("font") and other.get("font")
+                            and _font_family(node["font"]) != _font_family(other["font"])):
                         continue
                     b = tuple(other["bounding box"])
                     gap = box[1] - b[3]
@@ -95,22 +105,25 @@ def prepare_layout(document: dict) -> dict:
 
 
 def caption_for_region(region, captions, height, nodes):
-    """Choose a caption below this crop in the same column, with no body in between."""
+    """Choose a figure caption below, or table caption above, without intervening body text."""
     candidates = []
     for caption in captions:
-        if not caption.get("caption label", "").startswith("Fig."):
+        label = caption.get("caption label", "")
+        if not label.startswith(("Fig.", "Table ")):
             continue
         left, bottom, right, top = caption["bounding box"]
-        gap = height - top - region[3]
+        is_table = label.startswith("Table ")
+        gap = region[1] - (height - bottom) if is_table else height - top - region[3]
         overlap = min(right, region[2]) - max(left, region[0])
-        if not (-4 <= gap <= 420) or overlap < min(right-left, region[2]-region[0]) * .55:
+        if not (-4 <= gap <= (120 if is_table else 420)) or overlap < min(right-left, region[2]-region[0]) * .55:
             continue
+        between_bottom, between_top = ((height-region[1], bottom) if is_table else (top, height-region[3]))
         blocked = False
         for node in nodes:
             if node is caption or node.get("type") == "caption" or not node.get("content"):
                 continue
             b = node.get("bounding box")
-            if not b or b[1] <= top or b[3] >= height-region[3]-2:
+            if not b or b[1] <= between_bottom or b[3] >= between_top-2:
                 continue
             if min(b[2], right)-max(b[0], left) < (right-left)*.5:
                 continue
