@@ -5,8 +5,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jre-
 
 WORKDIR /app
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir ".[ui,ocr]"
 COPY src/ ./src/
+RUN pip install --no-cache-dir ".[ui,ocr]"
 
 EXPOSE 8501
 CMD ["python", "-m", "streamlit", "run", "src/paper_localizer/web.py", "--server.address=0.0.0.0"]
