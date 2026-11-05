@@ -343,7 +343,8 @@ def _merge_regions(regions: list[Box]) -> list[Box]:
 
 def _pseudocode_region(caption: dict, nodes: list[dict], width: float, height: float) -> Box | None:
     """Text-only algorithm figures have no ink after suppressing text drawing."""
-    if not re.search(r"\bpseudocode\b", caption.get("content", ""), re.I): return None
+    label = caption.get("content", "")
+    if not re.search(r"\b(?:pseudocode|(?:source )?code|(?:property|function|procedure|algorithm)\s+\d+\s+definition)\b", label, re.I): return None
     cl, cb, cr, ct = caption["bounding box"]
     if cr-cl > width*.55: return None
     left, right = (0, width/2) if (cl+cr)/2 < width/2 else (width/2, width)
@@ -362,7 +363,11 @@ def _pseudocode_region(caption: dict, nodes: list[dict], width: float, height: f
         if node.get("type") == "heading" and re.match(r"^(?:\d+(?:\.\d+)*\.?\s+|[IVXLCDM]+\.\s+)[A-Z]", text): break
         group.append(node);top=max(top,box[3])
     control = sum(bool(re.match(r"^(?:for|while|if|else|return|//)\b|^//", n["content"].strip())) for n in group)
-    if len(group) < 4 or control < 2: return None
+    numbered = [int(m[1]) for n in sorted(group,key=lambda n:-n["bounding box"][3])
+                if (m := re.match(r"^(\d+)\s+", n["content"].strip()))]
+    numbered_code = (len(numbered)>=4 and numbered==list(range(1,len(numbered)+1))
+                     and sum(bool(re.search(r"[(){};=]",n["content"])) for n in group)>=len(group)*.6)
+    if len(group) < 4 or control < 2 and not numbered_code: return None
     for node in group:
         if node.get("type") == "caption" and not node.get("caption label"):
             node["type"] = "paragraph"
@@ -549,14 +554,37 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                             ):
                                 regions.append(clipped)
                 regions = [r for r in regions if not _is_table(r, nodes, height)]
+                for table in document.get("source table regions", []):
+                    if table["page number"] != page_number: continue
+                    box = _node_box(table, height)
+                    regions = [r for r in regions if _intersection(r,box)/max(_area(r),1)<.85]
+                    regions.append(box)
                 labels = nodes + ([] if page_number in document.get("ocr pages", []) else _text_labels(page))
                 # Multi-panel plots share one caption. Group by the caption's
                 # column instead of joining everything that has nearby graphics.
                 from .layout import caption_for_region
-                captions = [n for n in nodes if n.get("type") == "caption"]
+                captions = [n for n in nodes if n.get("type") == "caption"
+                            and n.get("content", "").strip() and n.get("caption label")]
+                source_tables = [(_node_box(t,height),t["caption label"])
+                                 for t in document.get("source table regions",[]) if t["page number"]==page_number]
+                table_labels = {label for _,label in source_tables} | {
+                    n["caption label"] for n in nodes
+                    if n.get("source reconstructed table") and n.get("caption label")}
+                unclaimed_captions = [n for n in captions if n["caption label"] not in table_labels]
+                def owned_caption(region):
+                    table = next((label for box,label in source_tables
+                                  if _intersection(region,box)/max(_area(region),1)>.85
+                                  and _intersection(region,box)/max(_area(box),1)>.85),None)
+                    if table:
+                        return next((n for n in captions if n.get("caption label")==table),None)
+                    return caption_for_region(region,unclaimed_captions,height,nodes)
                 regions = _include_graphic_fragments(regions, fragments, captions, nodes, height)
                 expanded = []
                 for region in regions:
+                    if any(_intersection(region,box)/max(_area(region),1)>.98
+                           and _intersection(region,box)/max(_area(box),1)>.98 for box,_ in source_tables):
+                        expanded.append(region)
+                        continue
                     # A colored caption bullet can touch the figure's frame in
                     # the graphics mask. The caption must remain wholly outside
                     # the crop instead of leaving its first line inside it.
@@ -569,7 +597,7 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                                 and region[1]+18 < caption_top <= region[3]
                                 and region[3]-caption_top <= ct-cb+12):
                             region = region[0],region[1],region[2],caption_top-2
-                    caption = caption_for_region(region, captions, height, nodes)
+                    caption = owned_caption(region)
                     if caption:
                         left, _, right, _ = caption["bounding box"]
                         # A centered caption may be shorter than its figure.
@@ -599,7 +627,7 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 regions = _merge_regions(expanded)
                 grouped: dict[str, tuple[Box, dict | None]] = {}
                 for part_index, region in enumerate(regions):
-                    caption = caption_for_region(region, captions, height, nodes)
+                    caption = owned_caption(region)
                     key = str(id(caption)) if caption else f"unbound-{part_index}"
                     if key in grouped:
                         region = _union(grouped[key][0], region)

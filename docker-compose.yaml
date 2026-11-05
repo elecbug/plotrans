@@ -15,7 +15,7 @@ services:
     volumes:
       - ./outputs:/app/outputs
     ports:
-      - "127.0.0.1:8501:8501"
+      - "0.0.0.0:8501:8501"
     depends_on:
       - ollama
     networks:

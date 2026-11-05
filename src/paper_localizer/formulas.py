@@ -82,8 +82,17 @@ def _spans(page) -> list[TextSpan]:
 
     try:
         count = textpage.count_chars()
+        skip_low_surrogate = False
         for index in range(count):
+            if skip_low_surrogate:
+                skip_low_surrogate = False
+                continue
             code = pdfium.raw.FPDFText_GetUnicode(textpage, index)
+            if 0xD800 <= code <= 0xDBFF and index+1 < count:
+                low = pdfium.raw.FPDFText_GetUnicode(textpage, index+1)
+                if 0xDC00 <= low <= 0xDFFF:
+                    code = 0x10000 + ((code-0xD800)<<10) + low-0xDC00
+                    skip_low_surrogate = True
             text = chr(code) if 0 < code <= 0x10FFFF else "\ufffd"
             obj = textpage.get_textobj(index)
             if obj is None:
@@ -262,6 +271,8 @@ def _plain_text_group(group: list[TextSpan], node: dict) -> bool:
     baselines = [span.baseline for span in group]
     if min(sizes) < max(sizes) * .95 or max(baselines) - min(baselines) > max(sizes) * .12:
         return False
+    if node.get("native table cell") and re.fullmatch(r"[\d.,%()+*/=<>×÷−– -]+", text):
+        return True
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9.]*", text):
         return False
     # Italic P2P and version names can be split into letter/number spans by
@@ -303,6 +314,27 @@ def _insertions(content: str, spans: list[TextSpan], groups: list[list[TextSpan]
     target, offsets = _canonical(content)
     if not source or not target:
         return None
+    # When every decoded native character already agrees, use the full glyph
+    # positions. Removing math before alignment can make repeated short words
+    # such as "when d_in is" match the same letters inside the variable.
+    native = ""
+    native_positions = {}
+    for span in spans:
+        start = len(native)
+        native += _canonical(span.text)[0]
+        native_positions[span.index] = (start,len(native))
+    if native == target:
+        direct = []
+        for group in groups:
+            indices = {s.index for s in group}
+            start = min(native_positions[s.index][0] for s in group)
+            end = max(native_positions[s.index][1] for s in group)
+            if start == end or any(s.index not in indices and native_positions[s.index][0]<end
+                                   and native_positions[s.index][1]>start for s in spans): break
+            direct.append((offsets[start],offsets[end-1]+1))
+        else:
+            if all(a[1]<=b[0] for a,b in zip(direct,direct[1:])):
+                return direct
     matcher = SequenceMatcher(None, source, target, autojunk=False)
     matches = matcher.get_matching_blocks()
     if sum(match.size for match in matches) / max(len(source), 1) < 0.7:

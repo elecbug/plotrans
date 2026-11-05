@@ -70,7 +70,9 @@ def prepare_layout(document: dict) -> dict:
                     b = tuple(other["bounding box"])
                     gap = box[1] - b[3]
                     # Bounding boxes slightly overlap on superscripts in PDF text.
-                    if not (-size * 1.3 <= gap <= size * .55 + 1) or b[1] >= box[1]:
+                    continuation_overlap = (other.get("type") == "caption" and not parts[-1].rstrip().endswith((".", "!", "?"))
+                                            and b[3] < box[3] and gap >= -size*3)
+                    if (not (-size * 1.3 <= gap <= size * .55 + 1) and not continuation_overlap) or b[1] >= box[1]:
                         continue
                     tolerance = max(.35,size*.3) if node.get("font") == "OCR" else .35
                     if abs(float(other.get("font size") or size) - size) > tolerance:

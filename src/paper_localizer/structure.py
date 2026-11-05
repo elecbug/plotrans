@@ -13,6 +13,8 @@ from .figures import _PDFIUM_LOCK, _union, _nodes
 from .formulas import _canonical, _inside, _spans
 from .markup import FIGURE_LINK
 from .source_links import restore_printed_targets, source_printed_target
+from .source_roles import recover_authors, split_captions
+from .native_tables import recover_tables
 
 
 _NUMBERED_TITLE = re.compile(r"^(?:[IVXLCDM]+\.\s+|[A-Z]\.\s+|\d+(?:\.\d+)*[.)]?\s+)\S")
@@ -379,13 +381,14 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
     by_page = defaultdict(list)
     for node in nodes:
         by_page[node.get("page number", 1)].append(node)
-    repaired, sizes, spacing_repairs, link_repairs = [], {}, [], []
+    repaired, sizes, spacing_repairs, link_repairs, front_spans = [], {}, [], [], []
     with _PDFIUM_LOCK, pdfium.PdfDocument(pdf_path) as pdf:
         for page_number in range(1, len(pdf) + 1):
             page = pdf[page_number - 1]
             try:
                 sizes[str(page_number)] = list(page.get_size())
                 spans = [] if page_number in document.get("ocr pages", []) else _spans(page)
+                if page_number == 1: front_spans = spans
                 textpage = page.get_textpage()
                 try:
                     links = [link for link in document.get("source links", []) if page_number in link.get("pages", [])]
@@ -398,6 +401,8 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
                     _join_drop_caps(page_nodes)
                     if spans:
                         page_nodes.extend(_recover_uncovered_prose(page_nodes, spans, textpage, *page.get_size(), page_number))
+                        page_nodes = [part for node in page_nodes for part in split_captions(node,spans,page.get_size()[0])]
+                        page_nodes.extend(recover_tables(page,page_nodes,spans,textpage,page_number,document))
                     for node in page_nodes:
                         if node.get("type") == "table":
                             _repair_table_cells(node, textpage)
@@ -414,7 +419,8 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
                         if node.get("suppressed"):
                             repaired.append(node)
                         else:
-                            repaired.extend(_split_titles(node, spans))
+                            for part in split_captions(node, spans, page.get_size()[0]):
+                                repaired.extend(_split_titles(part, spans))
                 finally:
                     textpage.close()
             finally:
@@ -430,6 +436,7 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
         if node.get("type") in {"paragraph", "list item"}:
             node["source paragraph text"] = node.get("content", "")
     _front_matter(document)
+    recover_authors(document, front_spans)
     return document
 
 
