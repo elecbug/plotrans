@@ -5,6 +5,8 @@ services:
       - ollama_models:/root/.ollama
     ports:
       - "127.0.0.1:11434:11434"
+    networks:
+      - plotrans-net
 
   app:
     build: .
@@ -16,6 +18,15 @@ services:
       - "127.0.0.1:8501:8501"
     depends_on:
       - ollama
+    networks:
+      - plotrans-net
 
 volumes:
   ollama_models:
+
+networks:
+  plotrans-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.230.11.0/24
