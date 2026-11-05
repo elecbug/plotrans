@@ -4,8 +4,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends openjdk-17-jre-
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-RUN pip install --no-cache-dir ".[ui,ocr]"
 COPY pyproject.toml ./
+RUN pip install --no-cache-dir ".[ui,ocr]"
 COPY src/ ./src/
 
 EXPOSE 8501
