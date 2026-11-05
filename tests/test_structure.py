@@ -19,7 +19,7 @@ def fixture_pdf(path, pages):
     fonts = {name: DictionaryObject({NameObject('/Type'): NameObject('/Font'),
                                     NameObject('/Subtype'): NameObject('/Type1'),
                                     NameObject('/BaseFont'): NameObject('/' + font)})
-             for name, font in [('F1', 'Helvetica-Oblique'), ('F2', 'Times-Roman'), ('F3', 'Helvetica-Bold')]}
+             for name, font in [('F1', 'Helvetica-Oblique'), ('F2', 'Times-Roman'), ('F3', 'Helvetica-Bold'), ('F4', 'Courier')]}
     for operations in pages:
         page = writer.add_blank_page(width=600, height=600)
         page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'): DictionaryObject({

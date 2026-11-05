@@ -94,7 +94,17 @@ def recover_tables(page, nodes: list[dict], spans, textpage, page_number: int, d
         if group is None:groups.append([box])
         else:group.append(box)
     recovered=[];candidates=[]
+    separated=[]
     for rules in groups:
+        cluster=[]
+        for rule in sorted(rules,key=lambda b:-b[3]):
+            if cluster and any(n.get('bounding box') and caption_label(n.get('content',''))
+                               and rule[3]<n['bounding box'][1] and n['bounding box'][3]<cluster[-1][1]
+                               for n in nodes):
+                separated.append(cluster);cluster=[]
+            cluster.append(rule)
+        if cluster:separated.append(cluster)
+    for rules in separated:
         if len(rules)<3:continue
         box=rules[0]
         for rule in rules[1:]:box=_union(box,rule)

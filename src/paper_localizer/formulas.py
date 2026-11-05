@@ -71,7 +71,7 @@ def _spans(page) -> list[TextSpan]:
             box = first.box
             for span in pending[1:]: box = _union(box, span.box)
             seed = any(span.math for span in pending) or text in {"=", "+", "≤", "≥", "∑", "∫", "√", "±", "×"}
-            seed = seed or (len(text) == 1 and text.isalpha() and bool(re.search("Italic|Oblique|It$", first.font_name, re.I)))
+            seed = seed or (len(text) == 1 and text.isalpha() and bool(re.search("Italic|Oblique|Ital$|It$", first.font_name, re.I)))
             # Operators in a monospaced program are source code, not formula
             # seeds. Cropping `p =` out of a C declaration destroys the program.
             if re.search(r"Courier|Mono|Consolas", first.font_name, re.I):
@@ -165,7 +165,7 @@ def _expand_expressions(spans: list[TextSpan]) -> list[TextSpan]:
         text = span.text
         return (span.math or span.index in identifiers or text in _FUNCTIONS or text.replace(".", "").isdigit()
                 or (len(text) == 1 and text.isalpha())
-                or (text.isalpha() and bool(re.search("Italic|Oblique|It$", span.font_name, re.I)))
+                or (text.isalpha() and bool(re.search("Italic|Oblique|Ital$|It$", span.font_name, re.I)))
                 or all(char in "+-=–*/^_()[]{}<>|,:;≤≥≈≠∞·×÷∈∉∪∩…" for char in text)
                 or text == "...")
 
@@ -271,6 +271,8 @@ def _plain_text_group(group: list[TextSpan], node: dict) -> bool:
     baselines = [span.baseline for span in group]
     if min(sizes) < max(sizes) * .95 or max(baselines) - min(baselines) > max(sizes) * .12:
         return False
+    if node.get('type')=='heading' and re.fullmatch(r'[A-Za-z]',text):
+        return True
     if node.get("native table cell") and re.fullmatch(r"[\d.,%()+*/=<>×÷−– -]+", text):
         return True
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9.]*", text):
@@ -323,7 +325,9 @@ def _insertions(content: str, spans: list[TextSpan], groups: list[list[TextSpan]
         start = len(native)
         native += _canonical(span.text)[0]
         native_positions[span.index] = (start,len(native))
-    if native == target:
+    complete_matches = ([(0,0,len(native))] if native==target else
+                        [(m.a,m.b,m.size) for m in SequenceMatcher(None,native,target,autojunk=False).get_matching_blocks()])
+    if sum(size for _,_,size in complete_matches)>=max(len(native),len(target))*.97:
         direct = []
         for group in groups:
             indices = {s.index for s in group}
@@ -331,7 +335,10 @@ def _insertions(content: str, spans: list[TextSpan], groups: list[list[TextSpan]
             end = max(native_positions[s.index][1] for s in group)
             if start == end or any(s.index not in indices and native_positions[s.index][0]<end
                                    and native_positions[s.index][1]>start for s in spans): break
-            direct.append((offsets[start],offsets[end-1]+1))
+            match=next(((a,b) for a,b,size in complete_matches if a<=start and end<=a+size),None)
+            if match is None:break
+            mapped=match[1]+start-match[0]
+            direct.append((offsets[mapped],offsets[mapped+end-start-1]+1))
         else:
             if all(a[1]<=b[0] for a,b in zip(direct,direct[1:])):
                 return direct
@@ -543,13 +550,58 @@ def _group_node_box(nodes: list[dict]) -> Box:
     return box
 
 
+def _complete_display_equations(nodes, spans, textpage, width, tables=()):
+    """Join nearby pieces of isolated, indented display equations."""
+    prose=[n for n in nodes if n.get('type')=='paragraph' and not n.get('suppressed')
+           and len(n.get('content','').split())>=15 and _box(n) and _box(n)[2]-_box(n)[0]>width*.5]
+    if not prose:return
+    left=min(_box(n)[0] for n in prose);right=max(_box(n)[2] for n in prose)
+    groups=[]
+    for node in nodes:
+        box=_box(node);text=node.get('content','');size=float(node.get('font size') or 10)
+        definition=(len(re.findall(r'[A-Za-z]{3,}',text))>=4
+                    and re.match(r'^(?:[A-Za-z][A-Za-z0-9_]*|[A-Za-z]\([^)]{1,12}\))\s*=',text))
+        if (not box or not text or node.get('suppressed') or node.get('type') not in {'paragraph','formula'}
+                or re.search(r'Courier|Mono|Consolas',node.get('font',''),re.I)
+                or box[0]<=left+size*1.5 or box[2]>right+1 or box[2]-box[0]>(right-left)*.8
+                or box[3]-box[1]>size*5 or len(re.findall(r'[A-Za-z]{3,}',text))>2 and not definition
+                or any(_intersection(box,t)/max(_area(box),1)>.8 for t in tables)):
+            continue
+        if definition and any(s.math and _inside(s.box,box,padding=.5) for s in spans):
+            node.update({'source display equation':True,'source display definition':True,'display fragments':1})
+            continue
+        group=[node]
+        while True:
+            hit=next((i for i,(other,b) in enumerate(groups)
+                      if max(box[1]-b[3],b[1]-box[3],0)<=2
+                      and max(box[0]-b[2],b[0]-box[2],0)<=size*2.5
+                      and _union(box,b)[3]-_union(box,b)[1]<=size*4),None)
+            if hit is None:break
+            other,b=groups.pop(hit);group+=other;box=_union(box,b)
+        groups.append((group,box))
+    for group,box in groups:
+        if len(group)<2 or not any('=' in n['content'] for n in group):continue
+        selected=[s for s in spans if _inside(s.box,box,padding=.5)]
+        if sum(s.math for s in selected)<3:continue
+        ordinary=[s for s in selected if not s.math and re.search(r'[A-Za-z]{3,}',s.text)]
+        if len(ordinary)>3:continue
+        owner=min(group,key=lambda n:_box(n)[0])
+        owner.update({'type':'formula','content':' '.join(textpage.get_text_bounded(*box).split()),
+                      'bounding box':list(box),'source display equation':True,'display fragments':len(group)})
+        for node in group:
+            if node is not owner:node['suppressed']=True
+
+
 def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
     """Insert faithful inline PNG equations, keeping ordinary text editable."""
     with pdf_path.open("rb") as file:
         digest = hashlib.file_digest(file, "sha256").hexdigest()[:12]
     asset_dir = output_dir / "figs" / digest
     by_page: dict[int, list[dict]] = defaultdict(list)
+    table_boxes: dict[int, list[Box]] = defaultdict(list)
     for node in _nodes(document):
+        if node.get('type')=='table' and _box(node):
+            table_boxes[node.get('page number',1)].append(_box(node))
         if isinstance(node.get("content"), str) and _box(node):
             by_page[node.get("page number", 1)].append(node)
     figures = document.get("figures", [])
@@ -564,7 +616,8 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 if page_number in document.get("ocr pages", []):
                     continue
                 width, height = page.get_size()
-                spans = _spans(page)
+                from .review_layout import filter_counters
+                spans = filter_counters(_spans(page),document,page_number)
                 undecoded = sum(not s.font_name for s in spans)
                 if spans and undecoded / len(spans) > .75:
                     # Some old PDFs encode *all prose* as custom Type3 glyphs.
@@ -588,15 +641,20 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     continue
                 figure_boxes = [_box(f) for f in figures if f["page number"] == page_number]
                 nodes = by_page.get(page_number, [])
+                textpage=page.get_textpage()
+                try:_complete_display_equations(nodes,spans,textpage,width,table_boxes[page_number])
+                finally:textpage.close()
                 _recover_code(page, nodes)
                 document["deduplicated figure text"] = document.get("deduplicated figure text", 0) + _remove_figure_duplicates(
                     nodes, spans, figure_boxes)
                 spans = [span for span in spans if not any(
                     box and _intersection(span.box, box) / max(_area(span.box), 1) > 0.7 for box in figure_boxes
                 )]
+                displays=[n for n in nodes if n.get('source display equation') and not n.get('suppressed')]
+                spans=[s for s in spans if not any(_inside(s.box,_box(n),padding=.5) for n in displays)]
                 assignments: dict[int, list[TextSpan]] = defaultdict(list)
                 unassigned: list[TextSpan] = []
-                nodes = [node for node in nodes if node.get("content", "").strip()]
+                nodes = [node for node in nodes if node.get("content", "").strip() and not node.get('suppressed')]
                 plain_ids = set()
                 for group in _groups(spans):
                     if any(_inside(_group_box(group), _box(node), padding=.5)
@@ -648,6 +706,15 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     align_em = (bottom - baseline) / font_size
                     return inline_image_tag(reference, alt, height_em, align_em, aspect)
 
+                for node in displays:
+                    if node.get('source display definition'):
+                        node['formula snapshot']=save(_box(node),block=True)
+                    else:
+                        node['content']=save(_box(node),block=True)
+                        node['formula image']=True
+                    document.setdefault('completed display equations',[]).append({'page':page_number,'box':node['bounding box'],
+                                                                                'fragments':node['display fragments'],
+                                                                                'definition':bool(node.get('source display definition'))})
                 for index, assigned in assignments.items():
                     node = nodes[index]
                     node_box = _box(node)

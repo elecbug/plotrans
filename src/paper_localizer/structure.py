@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 from pathlib import Path
 import re
+import unicodedata
 from statistics import median
 
 import pypdfium2 as pdfium
@@ -15,6 +16,7 @@ from .markup import FIGURE_LINK
 from .source_links import restore_printed_targets, source_printed_target
 from .source_roles import recover_authors, split_captions
 from .native_tables import recover_tables
+from .review_layout import remove_line_counters
 
 
 _NUMBERED_TITLE = re.compile(r"^(?:[IVXLCDM]+\.\s+|[A-Z]\.\s+|\d+(?:\.\d+)*[.)]?\s+)\S")
@@ -66,21 +68,23 @@ def _line_text(line) -> str:
     return re.sub(r"\s*-\s*", "-", text)
 
 
-def _is_title(text: str, font_name: str = "") -> bool:
+def _is_title(text: str, font_name: str = "", outline: bool = False) -> bool:
     letters = "".join(char for char in text if char.isalpha())
-    capitals = bool(letters and letters.isupper() and (
+    capitals = bool(len(letters) >= 3 and letters.isupper() and (
         _NUMBERED_TITLE.match(text) or re.sub(r"\s+", "", text) in {"REFERENCES", "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS"}))
     mixed = bool(re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z]", text)
-                 and re.search(r"Bold|Medi|Semibold|TB$", font_name, re.I)
+                 and (re.search(r"Bold|Medi|Semibold|TB$", font_name, re.I)
+                      or (outline or re.search(r'Italic|Oblique|Ital|It$',font_name))
+                      and re.match(r"^\d+(?:\.\d+)+\.?\s",text))
                  and len(text.split()) <= 15 and not text.endswith((".", ";")))
     return capitals or mixed
 
 
 def _heading_level(text: str, font_name: str = "") -> int:
-    if re.sub(r"\s+", "", text) in {"REFERENCES", "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS"}: return 2
+    if re.sub(r"\s+", "", text).upper() in {"REFERENCES", "ACKNOWLEDGMENTS", "ACKNOWLEDGEMENTS"}: return 2
     if re.match(r"^[IVXLCDM]+\.\s", text) and not re.search(r"Italic|Oblique|It$", font_name, re.I): return 2
     if re.match(r"^[A-Z]\.\s", text): return 3
-    if re.match(r"^\d+(?:\.\d+)+\s", text): return 3
+    if match := re.match(r"^(\d+(?:\.\d+)+)\.?\s", text): return min(6,len(match[1].split('.'))+1)
     if re.match(r"^\d+[.)]?\s", text): return 2
     return 4
 
@@ -92,26 +96,33 @@ def _line_box(lines) -> list[float]:
     return list(box)
 
 
+def _title_characters(text):
+    key,offsets=_canonical(text)
+    selected=[i for i,c in enumerate(key) if unicodedata.category(c) not in {'Mn','Mc','Me','Sk'}]
+    return ''.join(key[i] for i in selected),[offsets[i] for i in selected]
+
+
 def _split_titles(node: dict, spans) -> list[dict]:
     text = node.get("content", "").strip()
     if not text or node.get("type") in {"table", "caption", "image", "picture", "header", "footer"}:
         return [node]
     lines = _source_lines(node, spans)
+    outline = node.get("pdfua_tag") == "LI"
     if lines:
         node["source first line indent"] = lines[0][0].box[0] - node["bounding box"][0]
     if not lines: return [node]
-    if not _is_title(_line_text(lines[0]), lines[0][0].font_name):
-        source_key = _canonical(text)[0]
+    if not _is_title(_line_text(lines[0]), lines[0][0].font_name, outline):
+        source_key = _title_characters(text)[0]
         start = next((i for i,line in enumerate(lines)
-                      if _is_title(_line_text(line), line[0].font_name)
-                      and source_key.startswith(_canonical(_line_text(line))[0])), None)
+                      if _is_title(_line_text(line), line[0].font_name, outline)
+                      and source_key.startswith(_title_characters(_line_text(line))[0])), None)
         if start is None: return [node]
         # Layout bounds can include the tail of the preceding paragraph. That
         # neighboring line is not part of a source-matched heading's content.
         lines = lines[start:]
-    source, offsets = _canonical(text)
+    source, offsets = _title_characters(text)
     cursor, line_at, result = 0, 0, []
-    while line_at < len(lines) and _is_title(_line_text(lines[line_at]), lines[line_at][0].font_name):
+    while line_at < len(lines) and _is_title(_line_text(lines[line_at]), lines[line_at][0].font_name, outline):
         first, end = line_at, line_at + 1
         while end < len(lines):
             candidate = _line_text(lines[end])
@@ -121,7 +132,7 @@ def _split_titles(node: dict, spans) -> list[dict]:
             if lines[end][0].font_name != lines[first][0].font_name: break
             end += 1
         title = " ".join(_line_text(line) for line in lines[first:end])
-        key = _canonical(title)[0]
+        key = _title_characters(title)[0]
         if not source[cursor:].startswith(key):
             return [node]  # A title is promoted only when the source text agrees.
         start_at = offsets[cursor]
@@ -145,6 +156,23 @@ def _split_titles(node: dict, spans) -> list[dict]:
             body["font size"] = lines[line_at][0].font_size
         result.append(body)
     return result or [node]
+
+
+def _split_abstract_keywords(node: dict, spans) -> list[dict]:
+    text=node.get('content','')
+    if node.get('page number')!=1 or not _ABSTRACT.match(text): return [node]
+    match=re.search(r'\b(?:keywords|index terms)\s*[:—-]',text,re.I)
+    if not match: return [node]
+    lines=_source_lines(node,spans)
+    split=next((i for i,line in enumerate(lines) if _KEYWORDS.match(_line_text(line))),None)
+    if split is None or split==0: return [node]
+    tail=' '.join(_line_text(line) for line in lines[split:])
+    if _canonical(tail)[0]!=_canonical(text[match.start():])[0]: return [node]
+    abstract=dict(node,content=text[:match.start()].strip(),**{'bounding box':_line_box(lines[:split])})
+    keywords=dict(node,type='keywords',content=text[match.start():].strip(),
+                  **{'bounding box':_line_box(lines[split:])})
+    keywords.pop('id',None)
+    return [abstract,keywords]
 
 
 def _front_matter(document: dict) -> None:
@@ -188,7 +216,7 @@ def _front_matter(document: dict) -> None:
     abstract_bottom = max(boundaries, default=height*.2)
     for node in nodes:
         box = node.get("bounding box")
-        if not box or node is title: continue
+        if not box or node is title or node.get('type') in {'header','footer'}: continue
         aligned = abs(box[0]-abstract_box[0]) < 15
         if (node is abstract or aligned and box[3] <= abstract_top+2 and box[1] > abstract_bottom
                 and node.get("type") not in {"frontmatter", "footer", "header"}
@@ -218,7 +246,10 @@ def _front_matter(document: dict) -> None:
     body_size = median(sizes) if sizes else 10
     for node in nodes:
         box = node.get("bounding box")
-        if not box or node.get("type") in {"abstract", "heading", "caption", "table"}: continue
+        if not box or node.get("type") in {"abstract", "heading", "caption", "table", "header", "footer"}: continue
+        if (box[2]<abstract_box[0]-4 and re.search(r'Received:|Revised:|Academic Editor:|Copyright:',node['content'],re.I)):
+            node['type']='frontmatter'
+            continue
         if re.match(r"^(?:[-•■▪‣]\s*)?(?:Fig(?:ure)?\.?|Table)\s*(?:\d|[IVXLCDM]+\b)|^\[\d+\]\s", node["content"], re.I): continue
         if (box[3] < height*.30 and float(node.get("font size") or body_size) < body_size*.94
                 and len(node["content"].split()) > 4):
@@ -320,6 +351,21 @@ def _mark_page_furniture(document: dict) -> None:
             node["type"] = side
             node["page furniture reason"] = "repeated native text in the same outer margin"
             furniture.append({"page": node["page number"], "text": node["content"], "box": node["bounding box"]})
+    repeated_text=defaultdict(list)
+    for node in document['kids']:
+        box=node.get('bounding box');page=node.get('page number',1)
+        if not box or not node.get('content'): continue
+        height=document['page sizes'][str(page)][1]
+        if not (box[3]<height*.09 or box[1]>height*.91): continue
+        text=re.sub(r'\b\d+\s+of\s+\d+\b','',node['content'],flags=re.I)
+        words=tuple(re.findall(r'[a-z]{2,}',text.casefold()))
+        if len(words)>=6:repeated_text[words].append(node)
+    for candidates in repeated_text.values():
+        if len({n['page number'] for n in candidates})<minimum:continue
+        for node in candidates:
+            height=document['page sizes'][str(node['page number'])][1]
+            node['type']='footer' if node['bounding box'][3]<height*.09 else 'header'
+            node['page furniture reason']='repeated source text in an outer page margin'
 
 
 def _recover_uncovered_prose(nodes: list[dict], spans, textpage, width, height, page_number) -> list[dict]:
@@ -346,9 +392,10 @@ def _recover_uncovered_prose(nodes: list[dict], spans, textpage, width, height, 
     def flush():
         if not group: return
         text = " ".join(item[1] for item in group)
-        if len(re.findall(r"\b[A-Za-z]{2,}\b", text)) < 7: return
-        if not re.search(r"[.!?,;:]", text): return
         box = _line_box([s for _,_,s in group])
+        minimum=4 if box[3]<height*.09 or box[1]>height*.91 else 7
+        if len(re.findall(r"\b[A-Za-z]{2,}\b", text)) < minimum: return
+        if not re.search(r"[.!?,;:]", text): return
         recovered.append({"type": "paragraph", "content": text, "bounding box": box,
                           "page number": page_number, "font": group[0][2][0].font_name,
                           "font size": group[0][2][0].font_size, "source text recovered": True})
@@ -398,6 +445,8 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
                             if printed := source_printed_target(native_page, link.get("url")):
                                 link.setdefault("printed targets", {})[str(page_number)] = printed
                     page_nodes = by_page.get(page_number, [])
+                    if spans:
+                        spans = remove_line_counters(page_nodes,spans,page.get_size()[0],page_number,document)
                     _join_drop_caps(page_nodes)
                     if spans:
                         page_nodes.extend(_recover_uncovered_prose(page_nodes, spans, textpage, *page.get_size(), page_number))
@@ -414,13 +463,19 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
                                 node["content"], repairs = restore_printed_targets(node["content"], native, links)
                                 link_repairs.extend(dict(repair, page=page_number) for repair in repairs)
                         text = node.get("content", "").strip()
+                        if re.match(r"^(?:Disclaimer/)?Publisher['’]s Note\s*:",text,re.I):
+                            node['type']='frontmatter'
+                            node['source information role']='publisher note'
                         if node.get("type") == "list item" and not _LIST_MARKER.match(text):
                             node["type"] = "paragraph"
+                        if node.get('type')=='heading' and text.casefold()=='references':
+                            node['heading level']=2
                         if node.get("suppressed"):
                             repaired.append(node)
                         else:
                             for part in split_captions(node, spans, page.get_size()[0]):
-                                repaired.extend(_split_titles(part, spans))
+                                for section in _split_abstract_keywords(part,spans):
+                                    repaired.extend(_split_titles(section, spans))
                 finally:
                     textpage.close()
             finally:
@@ -559,7 +614,7 @@ def _reference_flows(nodes: list[dict]) -> None:
             previous, reference_id = None, ""
             continue
         text = node.get("source paragraph text", node.get("content", "")).strip()
-        if re.match(r"^\[\d+\]\s+", text):
+        if re.match(r"^(?:\[\d+\]|\d{1,3}[.)])\s+", text):
             reference_id = f"reference-{index}"
         elif previous and reference_id:
             first, second = previous.get("bounding box"), node.get("bounding box")
