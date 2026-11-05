@@ -43,7 +43,11 @@ def main():
     code=next((n['content'] for n in nodes('bitcoin') if n.get('type')=='code' and 'AttackerSuccessProbability' in n.get('content','')),'')
     check('C listing remains text',code.startswith('```') and '<img' not in code and 'poisson *= lambda / i;' in code and 'sum -= poisson * (1 - pow(q / p, z - k));' in code,'Bitcoin p.7')
     equations=documents['bitcoin'].get('math transcriptions',{})
-    piecewise=next((text for source,text in equations.items() if 'page-006-math-005' in source),'')
+    # Crop numbering changes when complete display equations are emitted before
+    # inline notation. Identify the source display on page 6 by its role.
+    displays={asset['source'] for asset in documents['bitcoin'].get('formulas',[])
+              if asset['page number']==6 and asset.get('block')}
+    piecewise=next((text for source,text in equations.items() if source in displays),'')
     check('Piecewise exponent is z',re.search(r'\^\s*\{\s*z\s*\}',piecewise) and not re.search(r'\^\s*\{\s*2\s*\}',piecewise),'Bitcoin p.6')
     caption=next(n for n in nodes('pastry') if n.get('type')=='caption' and n.get('caption label')=='Fig. 7')
     check('Fig.7 caption retains three parameter images',caption.get('content','').count('<img')==3 and '5,000 nodes' in caption.get('content',''),'Pastry p.16')
