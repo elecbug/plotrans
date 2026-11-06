@@ -57,6 +57,10 @@ class Chunk:
 
 
 def _descendant_text(node: dict) -> str:
+    if node.get('suppressed'):
+        return ''
+    if snapshot := node.get('formula snapshot'):
+        return snapshot
     pieces: list[str] = []
     content = node.get("content")
     if isinstance(content, str) and content.strip():
@@ -130,11 +134,11 @@ def extract_blocks(document: dict) -> list[Block]:
         if node.get("attached caption"):
             return
         if kind == "footnote":
-            if content := node.get("content"):
-                footnotes.append(Block(page, "paragraph", content))
+            if content := node.get('formula snapshot') or node.get("content"):
+                footnotes.append(Block(page, "formula" if node.get('formula snapshot') else "paragraph", content))
             return
         if kind == "frontmatter":
-            if content := node.get("content"):
+            if content := node.get('formula snapshot') or node.get("content"):
                 front_matter.append(Block(page, kind, content))
             return
         if kind == "keywords":

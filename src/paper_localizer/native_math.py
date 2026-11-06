@@ -32,6 +32,20 @@ _SYMBOLS = {
 _PUNCTUATION = set("+*/=<>()[].,:;|^_{}-")
 
 
+def normalized_math_character(char):
+    """Remove font encoding while retaining distinct Greek symbol variants."""
+    name = unicodedata.name(char,'')
+    if char.isalpha() and 'GREEK' in name:
+        return char
+    if name.startswith('MATHEMATICAL '):
+        parts = unicodedata.decomposition(char).split()
+        if len(parts)==2 and parts[0]=='<font>':
+            base = chr(int(parts[1],16))
+            if base.isalpha() and 'GREEK' in unicodedata.name(base,''):
+                return base
+    return unicodedata.normalize('NFKC',char)
+
+
 def native_expression(page, box) -> str | None:
     """Accept only decoded single-line glyphs with explainable script positions.
 
@@ -41,13 +55,27 @@ def native_expression(page, box) -> str | None:
     textpage = page.get_textpage()
     chars = []
     try:
-        for index in range(textpage.count_chars()):
+        skip_low_surrogate = False
+        count = textpage.count_chars()
+        for index in range(count):
+            if skip_low_surrogate:
+                skip_low_surrogate = False
+                continue
             code = pdfium.raw.FPDFText_GetUnicode(textpage, index)
+            low_index = None
+            if 0xd800 <= code <= 0xdbff and index+1 < count:
+                low = pdfium.raw.FPDFText_GetUnicode(textpage,index+1)
+                if 0xdc00 <= low <= 0xdfff:
+                    low_index = index+1
+                    code = 0x10000+((code-0xd800)<<10)+low-0xdc00
+                    skip_low_surrogate = True
             bounds = textpage.get_charbox(index)
             x, y = (bounds[0]+bounds[2])/2, (bounds[1]+bounds[3])/2
             if not (box[0] <= x <= box[2] and box[1] <= y <= box[3]): continue
-            if bounds[0] == bounds[2] or bounds[1] == bounds[3]: continue
+            if bounds[0] == bounds[2] or bounds[3]-bounds[1] < .01: continue
             if pdfium.raw.FPDFText_HasUnicodeMapError(textpage, index) != 0: return None
+            if low_index is not None and pdfium.raw.FPDFText_HasUnicodeMapError(textpage,low_index) != 0:
+                return None
             if code in {9, 10, 13, 32}: continue
             if not 0 < code <= 0x10FFFF: return None
             original = chr(code)
@@ -56,8 +84,8 @@ def native_expression(page, box) -> str | None:
             styled_math = unicode_name.startswith("MATHEMATICAL ") and not unicode_name.startswith("MATHEMATICAL ITALIC ")
             if (styled_math or any(style in unicode_name for style in ("DOUBLE-STRUCK", "FRAKTUR", "SCRIPT"))) and original not in _SYMBOLS:
                 return None
-            char = original if original in _SYMBOLS else unicodedata.normalize("NFKC", original)
-            if original != char and "GREEK" in unicode_name and original not in _SYMBOLS:
+            char = original if original in _SYMBOLS else normalized_math_character(original)
+            if len(char)==1 and 'GREEK' in unicodedata.name(char,'') and char not in _SYMBOLS:
                 return None
             if any(not (c.isalnum() or c in _SYMBOLS or c in _PUNCTUATION) for c in char): return None
             obj = textpage.get_textobj(index)

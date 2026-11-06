@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import unittest
+import textwrap
 from unittest.mock import Mock
 
 from pypdf import PdfWriter
@@ -19,7 +20,8 @@ def fixture_pdf(path, pages):
     fonts = {name: DictionaryObject({NameObject('/Type'): NameObject('/Font'),
                                     NameObject('/Subtype'): NameObject('/Type1'),
                                     NameObject('/BaseFont'): NameObject('/' + font)})
-             for name, font in [('F1', 'Helvetica-Oblique'), ('F2', 'Times-Roman'), ('F3', 'Helvetica-Bold'), ('F4', 'Courier')]}
+             for name, font in [('F1', 'Helvetica-Oblique'), ('F2', 'Times-Roman'), ('F3', 'Helvetica-Bold'),
+                                ('F4', 'Courier'), ('F5', 'Symbol')]}
     for operations in pages:
         page = writer.add_blank_page(width=600, height=600)
         page[NameObject('/Resources')] = DictionaryObject({NameObject('/Font'): DictionaryObject({
@@ -37,6 +39,42 @@ def paragraph(text, box, page=1, **kwargs):
 
 
 class StructureTests(unittest.TestCase):
+    def test_centered_abstract_label_omitted_by_layout_uses_the_prose_column(self):
+        abstract = ('This abstract explains how source geometry identifies a complete paragraph, '
+                    'preserving its words and its boundaries while the reading edition keeps '
+                    'metadata separate from the body. The experiment compares several network '
+                    'designs and reports their behavior under changing conditions, with all '
+                    'measurements retained for later source review.')
+        title='A native source geometry study'
+        operations=b'BT /F3 16 Tf 30 560 Td ('+title.encode()+b') Tj ET '
+        operations+=b'BT /F3 14 Tf 260 480 Td (ABSTRACT) Tj ET '
+        for i,line in enumerate(textwrap.wrap(abstract,72)):
+            operations+=f'BT /F2 9 Tf 120 {460-i*11} Td ({line}) Tj ET '.encode()
+        operations+=b'BT /F2 10 Tf 30 330 Td (The body starts here without a printed section title.) Tj ET'
+        with tempfile.TemporaryDirectory() as directory:
+            pdf=Path(directory)/'source.pdf';fixture_pdf(pdf,[operations])
+            document=repair_structure(pdf,{'title':title,'kids':[
+                paragraph(title,[30,550,570,580],font='Helvetica-Bold',**{'font size':16}),
+                paragraph(abstract,[120,380,480,470],font='Times-Roman',**{'font size':9}),
+                paragraph('The body starts here without a printed section title.',[30,325,285,340],font='Times-Roman',**{'font size':10})]})
+            bodies=[n for n in document['kids'] if n.get('type')=='abstract' and n.get('content')]
+            self.assertEqual(len(bodies),1)
+            self.assertEqual(bodies[0]['content'],abstract)
+            self.assertTrue(any(n.get('source role heading recovered') for n in document['kids']))
+            self.assertTrue(any(n.get('type')=='paragraph' and n.get('content','').startswith('The body starts') for n in document['kids']))
+
+    def test_large_prose_drop_cap_joins_its_first_word_but_math_font_does_not(self):
+        for font in ['Helvetica-Bold','Helvetica-Oblique']:
+            with self.subTest(font=font),tempfile.TemporaryDirectory() as directory:
+                pdf=Path(directory)/'source.pdf'
+                fixture_pdf(pdf,[b'BT '+(b'/F3' if font=='Helvetica-Bold' else b'/F1')+b' 48 Tf 30 484 Td (P) Tj ET '
+                                 b'BT /F2 10 Tf 63 500 Td (eer-to-peer networks preserve the complete first word.) Tj ET'])
+                document=repair_structure(pdf,{'kids':[
+                    paragraph('P',[30,470,60,530],font=font,**{'font size':48}),
+                    paragraph('eer-to-peer networks preserve the complete first word.',[63,480,285,512],font='Times-Roman',**{'font size':10})]})
+                text=' '.join(n.get('content','') for n in document['kids'] if not n.get('suppressed'))
+                self.assertEqual('Peer-to-peer' in text,font=='Helvetica-Bold')
+
     def test_column_order_is_independent_of_parser_list_nesting(self):
         nodes = [paragraph('Right upper.', [320, 450, 570, 530]),
                  paragraph('Left lower.', [30, 300, 280, 380]),

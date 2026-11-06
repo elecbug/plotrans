@@ -36,6 +36,17 @@ class NativeMathTests(unittest.TestCase):
         self.assertIsNone(self.unicode_expression("x", mapping_errors={0: -1}))
         self.assertEqual(self.unicode_expression("xy", mapping_errors={1: 1}, box=[0, 390, 18, 420]), "x")
 
+    def test_utf16_math_letters_are_combined_before_source_transcription(self):
+        def units(value):
+            data = value.encode('utf-16-le')
+            return ''.join(chr(int.from_bytes(data[i:i+2],'little')) for i in range(0,len(data),2))
+        self.assertEqual(self.unicode_expression(units('𝜆')),r'\lambda')
+        self.assertEqual(self.unicode_expression(units('𝑥')),'x')
+        self.assertIsNone(self.unicode_expression(units('𝕏')))
+        self.assertIsNone(self.unicode_expression(units('𝜆'),mapping_errors={1:1}))
+        self.assertEqual(self.unicode_expression('x'+units('𝜆'),mapping_errors={2:1},box=[0,390,18,420]),'x')
+        self.assertIsNone(self.unicode_expression('\ud835'))
+
     def test_visible_braces_and_underscores_do_not_become_tex_syntax(self):
         for value in ("x∈{a,b}", "x_y"):
             with self.subTest(value=value):
@@ -58,6 +69,9 @@ class NativeMathTests(unittest.TestCase):
                 result = self.unicode_expression(value)
                 self.assertIsNotNone(result)
                 self.assertEqual("".join(ET.fromstring(mathml(result)).itertext()), value)
+        for styled,expected in [('𝜑','φ'),('𝜙','ϕ')]:
+            result = self.unicode_expression(styled)
+            self.assertEqual(''.join(ET.fromstring(mathml(result)).itertext()),expected)
 
     def test_unhandled_semantic_font_styles_and_greek_variants_defer_to_ocr(self):
         for value in ("𝕏", "𝖷", "𝔵", "𝓍", "ϐ"):

@@ -1,0 +1,21 @@
+{
+  "repository": "https://github.com/cmusphinx/cmudict",
+  "commit": "74790861f652b15e4ac49015a90074ad62a27690",
+  "files": {
+    "cmudict.dict": {
+      "url": "https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/cmudict.dict",
+      "sha256": "81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22",
+      "bytes": 3618488
+    },
+    "LICENSE": {
+      "url": "https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/LICENSE",
+      "sha256": "bd4ce8e44170a5f9f481310ca85c51de3c4f851a65e679b40e603b143bd3542a",
+      "bytes": 1754
+    }
+  },
+  "purpose": "Conservative English line-wrap normalization; lexical membership alone never authorizes deleting a source hyphen.",
+  "license_asset": "cmudict-LICENSE.txt",
+  "derived_asset": "english-words.json.gz",
+  "derived_sha256": "e4640e0c5e3eee60c49c86c6133984d6ed7880f5fe2e29145ad3caacba56f970",
+  "build_command": "python scripts/build_typography_lexicon.py cmudict.dict src/paper_localizer/assets/english-words.json.gz"
+}

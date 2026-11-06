@@ -139,7 +139,9 @@ Accepted OCR prose is restored as editable text with LaTeX equations, rendered o
 
 Tables whose text is drawn as vector outlines cannot be recovered through native text extraction. Their original images remain in the article, with captions above them. Optional OCR adds a collapsible **Searchable table transcription** only after two rendering resolutions agree on cells and spans, and independent CPU OCR supports at least 98% of long words and every plain numeric value. It checks 3x and 4.5x crops, with a 6x retry when needed. Install the `ocr` extra for this independent check. Equations inside cells still require visual review; consistency does not establish correct interpretation or cell assignment. Table images and transcriptions are not translated.
 
-Malformed table markup and empty or truncated region responses retain their source representation and record the reason in the OCR report. Readable native prose and numeric values must survive OCR replacement, even when two rendering resolutions agree. Model setup and initial connection errors stop processing with setup instructions. If the connection fails during recognition, the request is retried once; further uncached regions retain their source representation and the report records the failure.
+Malformed table markup and empty or truncated region responses retain their source representation and record the reason in the OCR report. Readable native prose and numeric values must survive OCR replacement, even when two rendering resolutions agree. This includes native words inside the complete crop beyond the layout node's original text, such as a preceding sentence ending covered by an oversized heading box. Model setup and initial connection errors stop processing with setup instructions. If the connection fails during recognition, the request is retried once; further uncached regions retain their source representation and the report records the failure.
+
+Nonempty responses that hit the model's generation limit are cached as failures for up to 24 hours, so rerunning an unchanged difficult crop does not repeat several minutes of unsuccessful inference. The failure identity includes the complete PDF hash, rendered image hash, model digest, endpoint, prompt, and generation options. Source images and the rejection reason remain available. Network errors, invalid responses, and empty responses are retried on a later run. Delete the relevant `.vision-cache/<PDF-hash>/*.failed.json` files to retry a generation-limit failure immediately.
 
 The `.ocr.json` output and ZIP record the actual model SHA-256 digest, preprocessing profile, region decisions, and equation/table transcriptions. `.vision-cache/` uses PDF content, model digest, region, resolution, and profile as its key. Use `--vision-ocr-digest` to verify the exact model version when reproducing a run. The model digest used for the documented experiment was:
 
@@ -187,6 +189,8 @@ The original abstract and generated summary are displayed separately. The body r
 Source glyphs and page geometry repair run-in headings and common two-column reading order, including full-width figures and tables. Heading promotion and spacing repairs require matching source characters. Authors, index terms, and small first-page notes retain separate roles. Continued source paragraphs are rejoined across page/column and model chunk boundaries. Figures, tables, and portraits reserve their space while loading, keeping document positions stable when navigating the table of contents. Complex layouts still need source review.
 
 Abstracts are bounded by their source column, including unlabeled and letter-spaced abstract headings. Complete native prose lines omitted by the layout extractor can be recovered from their page coordinates. Repeated page counters are classified using margin position and numbering sequence; matching numbers inside references remain intact. Missing numeric range dashes are restored only when the bounded source text confirms them.
+
+Standalone first-page abstract or introduction labels omitted by layout extraction can be recovered from isolated native text, typography, and following prose. A centered abstract label uses the prose column below it for classification. Body text following an explicitly classified abstract appears in a generated Full text section when the source has no printed section heading. It stays separate from author/source metadata. Large decorative first letters can join their source-confirmed first word using position, font size, and spelling checks.
 
 Review drafts, including MDPI-style manuscripts, can have small sequential line counters in an outer margin. These counters are separated using native positions, font sizes, baseline alignment, and numbering sequence. Removal requires character-inventory agreement and exact alignment of each counter; equal values inside prose, tables, and references are retained. Hierarchical regular or italic headings keep their source outline depth, and an abstract and keywords merged by the layout extractor can be split at their native line boundary. Publisher notices remain in source information, outside the numbered bibliography.
 
@@ -243,6 +247,24 @@ outputs/
 
 Markdown uses relative references such as `![Fig. p.2-1](figs/<PDF-hash>/page-002-fig-01.png)`. Extract the ZIP and retain its directory structure when moving documents to another computer. The web UI previews the same HTML document. Image paths are never sent to translation models, so models cannot alter them.
 
+## Source text fidelity
+
+Native glyph positions repair separated accents, including names such as `Erd˝os` → `Erdős`, multiple accents stored out of order, and TeX dotless i under an acute accent. Accented initials require an explicit marked initial in a numbered, dated reference. Mathematical modifiers, code, and URLs are excluded from these repairs.
+
+Real line endings are checked within the same column before repairing words such as `com- munication`. Removing a hard hyphen also requires a valid English hyphenation position and either a known English spelling or repeated unbroken native words. Existing compounds such as `topology-aware` keep their hyphen. A printed hyphen lost by extraction can be restored for a known compound or two independent English words whose concatenation is neither a known word, a common inflection, nor an unbroken spelling observed elsewhere in the PDF, such as `Model-checking`. Short missing endings of numbered footnotes are recovered only when the existing note agrees with the source and the continuation matches its position and font. Short bold labels omitted at page boundaries require matching examples in the document body.
+
+When inline math prevents whole-paragraph spacing restoration, long matching prose segments can still recover missing spaces. This operation inserts whitespace without changing letters, numbers, or equation glyphs. The processed audit JSON records the affected source regions and typography repairs. Uncertain regions retain their source representation.
+
+Missing spaces at a prose font change can also be restored when native glyph positions show a word-sized gap, both sides are English words, and their concatenation is not a known word. This repairs `itslocal` → `its local` without splitting known words, mathematical expressions, code, or URLs. Ambiguous repeated occurrences retain their existing text.
+
+Small omissions inside otherwise matching prose can be restored between native text anchors. The paragraph must have at least 90% agreement; existing letters within each repaired gap remain a source subsequence. The recovery adds native prose letters, punctuation, and spacing. This catches missing words even when the same words occur later in the paragraph. Mathematical or undecodable additions, code, numeric changes, links, and text outside the matching anchors are excluded. Audit JSON records these additions under `source prose insertions`.
+
+When layout bounds overlap neighboring rows, agreement is checked between matching paragraph anchors and the complete-box agreement is recorded separately. Local native font ownership keeps nearby mathematics out of prose additions. Short words, known source-word spellings, source punctuation, and explicit initials in numbered, dated references have separate checks. Prose snapshots also complete a partly covered ordinary word before its duplicate text is removed, with a bounded expansion.
+
+Dashes lost at line boundaries can also be restored between long, matching source anchors, preventing words such as `systems—particularly` from becoming `systemsparticularly`. These checks preserve source punctuation and exclude numeric boundaries, URLs, and code.
+
+The bundled English spelling inventory is a compressed, 339 KB derivative of CMUdict; parsing does not download a dictionary. Its pinned source and build instructions are recorded in [english-words-source.json](src/paper_localizer/assets/english-words-source.json), with the [CMUdict license](src/paper_localizer/assets/cmudict-LICENSE.txt). Pyphen supplies English hyphenation patterns. These checks are conservative and do not establish semantic accuracy.
+
 ## Preserving equations
 
 PDFs such as the Pastry paper use Type3 fonts without ToUnicode character mappings. Equations may be visible on the page but absent from extracted text. These equation fonts and separate mathematical font regions are rendered as small PNG crops and inserted into the text. They share the `figs/<PDF-hash>/` directory with figures and are included in the ZIP.
@@ -252,6 +274,14 @@ For example, `b=4`, `|L|=16`, and `|M|=32` in the Fig.7 caption are preserved as
 Inline equations use HTML tags such as `<img class="inline-math" ...>`. Their `em` height is based on surrounding text size, and vertical alignment follows the PDF baseline. Explicit `width` and `height` attributes keep them small in viewers that strip CSS. The same tags are restored in the original and translation. Use a Markdown viewer that supports HTML.
 
 If extraction omits an entire equation line, a standalone equation image is inserted. Regions with uncertain correspondence appear once as a source image. When a piecewise equation spans multiple text blocks, other blocks covered by the image are also cleaned up. Images are expanded to preserve content crossing region boundaries before duplicate text is removed. Text belonging to figure regions is also removed from the body using coordinate checks.
+
+When a prose snapshot also contains an inline crop belonging to a continuation, the parser can preserve both same-column fragments in one bounded source region. The outside prose remains in that region before its duplicate is removed. Headings, captions, code, figures, and populated tables limit expansion.
+
+Source snapshots also take precedence over incomplete text inside author/source information, notes, and table cells. Fully decoded numeric table cells with matching source values and a uniform baseline stay editable, including simple arrows and minus signs. Raised exponents and stacked fractions retain their original representation.
+
+Decoded mathematical Unicode characters are combined from UTF-16 pairs before source transcription. Greek variants such as `φ` and `ϕ` retain their identity. Invisible Type3 advance-only glyphs are excluded so they do not create thin, duplicate equation fragments. Ordinary list bullets do not seed equations; the same symbol between mathematical variables remains part of the expression.
+
+For optional OCR, agreement at two resolutions also requires agreement with available native operands, explicit operators, Greek letters, and single-line decimal values. A known symbol may not disappear merely because another glyph is undecodable. When native symbol comparison is unavailable, an additional image check can reject absolute/norm delimiters lacking supporting vertical strokes. This image check only rejects candidates and cannot establish correct transcription. Rejected formulas retain their source images; accepted OCR remains subject to visual review.
 
 Translation requests replace inline equations with markers such as `[[MATH_0001]]`. Each marker must appear exactly once in the response before its original image is restored. Missing or duplicated markers trigger one retry; persistent failure raises an error instead of saving a translation with missing equations. Chunk boundaries never split image paths.
 
@@ -285,6 +315,14 @@ python scripts/review_comparison.py .tmp/example/paper.pdf outputs/review/paper.
 ```
 
 Open `page-comparison/review.html` for all source pages alongside their extracted content. `review.json` checks decodable letter/digit preservation in the processed structure or retained images and identifies missing or blank assets. Caption abbreviations are counted separately. This check does not establish semantic accuracy, reading order, complete graphics, or correct OCR.
+
+To locate ordinary native words requiring closer review across a corpus:
+
+```sh
+python scripts/audit_source_coverage.py .tmp/example --audits outputs/review --output outputs/review/source-coverage.json
+```
+
+This diagnostic separates text matches, visible source crops, source-confirmed typography changes, removed furniture, and uncertain words by page. An uncertain word can be a normalization, a source link fragment, or material represented elsewhere; inspect its coordinates and containing text. OCR pages require separate visual review. The counts are not an overall accuracy score.
 
 The documented audit of 18 example papers validated extraction without running Ollama inference. Tests cover duplicated piecewise equations, split captions, multiple panels across two columns, Form XObject coordinates, subscripts, undecodable-font preservation, and output bundles.
 

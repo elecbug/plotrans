@@ -11,12 +11,17 @@ from statistics import median
 import pypdfium2 as pdfium
 
 from .figures import _PDFIUM_LOCK, _union, _nodes
-from .formulas import _canonical, _inside, _spans
+from .formulas import _canonical, _inside, _spans, _MATH_FONT
 from .markup import FIGURE_LINK
 from .source_links import restore_printed_targets, source_printed_target
 from .source_roles import recover_authors, split_captions
 from .native_tables import recover_tables
 from .review_layout import remove_line_counters
+from .source_text import (positioned_accents, normalize_accents, native_vocabulary,
+                          line_wraps, normalize_line_wraps, restore_local_spacing)
+from .source_text import restore_prose_dashes
+from .source_text import geometric_word_spaces, normalize_geometric_spaces
+from .source_text import restore_prose_omissions
 
 
 _NUMBERED_TITLE = re.compile(r"^(?:[IVXLCDM]+\.\s+|[A-Z]\.\s+|\d+(?:\.\d+)*[.)]?\s+)\S")
@@ -98,8 +103,12 @@ def _line_box(lines) -> list[float]:
 
 def _title_characters(text):
     key,offsets=_canonical(text)
-    selected=[i for i,c in enumerate(key) if unicodedata.category(c) not in {'Mn','Mc','Me','Sk'}]
-    return ''.join(key[i] for i in selected),[offsets[i] for i in selected]
+    characters,positions=[],[]
+    for char,offset in zip(key,offsets):
+        for part in unicodedata.normalize('NFD',char):
+            if unicodedata.category(part) not in {'Mn','Mc','Me','Sk'}:
+                characters.append(part);positions.append(offset)
+    return ''.join(characters),positions
 
 
 def _split_titles(node: dict, spans) -> list[dict]:
@@ -208,6 +217,17 @@ def _front_matter(document: dict) -> None:
     if not abstract: return
     abstract_top = abstract["bounding box"][3]
     abstract_box = abstract["bounding box"]
+    if _ABSTRACT.fullmatch(abstract['content'].strip()):
+        # A centered standalone label can be much narrower than its prose
+        # column. Classify the following prose using that column's left edge.
+        center = (abstract_box[0]+abstract_box[2])/2
+        following = [n for n in nodes if n is not abstract and n.get('bounding box')
+                     and n.get('type') in {'paragraph','list item','abstract'}
+                     and len(n.get('content','').split())>=45
+                     and 0<=abstract_box[1]-n['bounding box'][3]<=max(36,float(abstract.get('font size') or 10)*3)
+                     and n['bounding box'][0]<=center<=n['bounding box'][2]]
+        if following:
+            abstract_box = max(following,key=lambda n:n['bounding box'][3])['bounding box']
     boundaries = [n["bounding box"][3] for n in nodes if n.get("bounding box") and n is not abstract
                   and (n.get("type") == "heading" or _KEYWORDS.match(n["content"])
                        or re.match(r"CCS Concepts|Additional Key|ACM Reference", n["content"], re.I))
@@ -368,9 +388,12 @@ def _mark_page_furniture(document: dict) -> None:
             node['page furniture reason']='repeated source text in an outer page margin'
 
 
-def _recover_uncovered_prose(nodes: list[dict], spans, textpage, width, height, page_number) -> list[dict]:
+def _recover_uncovered_prose(nodes: list[dict], spans, textpage, width, height, page_number,
+                             known_labels=()) -> list[dict]:
     """Recover complete native prose lines omitted by the layout extractor."""
     boxes = [n["bounding box"] for n in nodes if n.get("bounding box")]
+    sizes = Counter(round(s.font_size,1) for s in spans if len(s.text)>2 and not s.math)
+    body_size = sizes.most_common(1)[0][0] if sizes else 0
     lines = []
     for span in sorted(spans, key=lambda s: (-s.baseline, s.box[0])):
         line = next((line for line in reversed(lines[-4:])
@@ -378,7 +401,7 @@ def _recover_uncovered_prose(nodes: list[dict], spans, textpage, width, height, 
                      and -2 <= span.box[0]-line[-1].box[2] < max(25, span.font_size*3)), None)
         if line is None: lines.append([span])
         else: line.append(span)
-    missing = []
+    missing, labels, role_headings = [], [], []
     for line in lines:
         box = _line_box([line])
         if box[1] < height*.025 or box[3] > height*.98: continue
@@ -387,13 +410,58 @@ def _recover_uncovered_prose(nodes: list[dict], spans, textpage, width, height, 
         text = " ".join(textpage.get_text_bounded(*[box[0]-.2,box[1]-.2,box[2]+.2,box[3]+.2]).split())
         if not text or "\ufffd" in text: continue
         if re.fullmatch(r"[\d\W]+", text): continue
+        role = _canonical(text)[0].casefold()
+        if (page_number==1 and role in {'abstract','introduction'}
+                and max(s.font_size for s in line)>=body_size*1.05
+                and all(s.font_name and not s.math and not _MATH_FONT.search(s.font_name) for s in line)):
+            center = (box[0]+box[2])/2
+            following = [n for n in nodes if n.get('bounding box') and not n.get('suppressed')
+                         and n.get('type') in {'paragraph','list item','abstract'}
+                         and len(n.get('content','').split())>=(45 if role=='abstract' else 12)
+                         and 0<=box[1]-n['bounding box'][3]<=max(36,max(s.font_size for s in line)*3)
+                         and n['bounding box'][0]<=center<=n['bounding box'][2]]
+            if following:
+                role_headings.append({'type':'heading','heading level':2,'content':text,
+                                      'bounding box':list(box),'page number':page_number,
+                                      'font':line[0].font_name,'font size':max(s.font_size for s in line),
+                                      'source role heading recovered':True})
+                continue
+        key = (_canonical(text)[0],line[0].font_name,round(line[0].font_size,1))
+        if key in known_labels and all(s.font_name==line[0].font_name for s in line):
+            labels.append({'type':'paragraph','content':text,'bounding box':list(box),
+                           'page number':page_number,'font':line[0].font_name,
+                           'font size':line[0].font_size,'source label recovered':True})
         missing.append((box, text, line))
     recovered, group = [], []
     def flush():
         if not group: return
         text = " ".join(item[1] for item in group)
         box = _line_box([s for _,_,s in group])
+        # Layout extraction can omit the short final line of a numbered
+        # footnote. Recovering only long standalone paragraphs misses it.
+        # Require a directly adjacent, small-font numbered note whose whole
+        # existing text agrees with the native source before appending it.
+        for node in nodes:
+            old_box, old = node.get('bounding box'), node.get('content','')
+            size = float(node.get('font size') or 0)
+            if (not old_box or node.get('suppressed') or node.get('type') not in {'paragraph','footnote'}
+                    or old_box[3] > height*.3 or not re.match(r'^\d{1,3}\s*[A-Za-z]',old)
+                    or not size or size >= body_size*.94 or abs(size-group[0][2][0].font_size) > size*.12
+                    or not 0 <= old_box[1]-box[3] < size*1.2
+                    or abs(old_box[0]-box[0]) > size
+                    or box[2] > old_box[2]+size or re.search(r'[.!?]["”\u2019]?$',old.rstrip())):
+                continue
+            native = textpage.get_text_bounded(*old_box).replace('\x02','').replace('\ufffe','')
+            if _canonical(native)[0] != _canonical(old)[0]:
+                continue
+            node.setdefault('source note continuations',[]).append({'text':text,'box':list(box),
+                                                                   'previous box':list(old_box)})
+            node['content'] = old.rstrip()+' '+text
+            node['bounding box'] = list(_union(old_box,box))
+            return
         minimum=4 if box[3]<height*.09 or box[1]>height*.91 else 7
+        if any(_inside(label['bounding box'],box,padding=.5) for label in labels):
+            minimum=2
         if len(re.findall(r"\b[A-Za-z]{2,}\b", text)) < minimum: return
         if not re.search(r"[.!?,;:]", text): return
         recovered.append({"type": "paragraph", "content": text, "bounding box": box,
@@ -405,18 +473,38 @@ def _recover_uncovered_prose(nodes: list[dict], spans, textpage, width, height, 
             flush();group=[]
         group.append(item)
     flush()
-    return recovered
+    # Labels supplement normal prose recovery. Removing a label from its
+    # native line group first would strand short following values such as
+    # "Unresolved." and cause a new omission at a page boundary.
+    recovered.extend(label for label in labels
+                     if not any(_inside(label['bounding box'],node.get('bounding box'),padding=.5)
+                                for node in recovered+nodes if node.get('bounding box')))
+    return recovered+role_headings
 
 
 def _join_drop_caps(nodes: list[dict]) -> None:
     for cap in nodes:
         text, box = cap.get("content", ""), cap.get("bounding box")
-        if cap.get("type") != "heading" or not re.fullmatch(r"[A-Z]", text) or not box: continue
+        if cap.get("type") not in {'heading','paragraph'} or not re.fullmatch(r"[A-Z]", text) or not box: continue
         following = next((n for n in nodes if n is not cap and n.get("bounding box")
+                          and cap.get('type')=='heading'
                           and 0 <= n["bounding box"][0]-box[2] <= 4
                           and abs(n["bounding box"][3]-box[3]) < 4
                           and re.match(r"^[A-Z]{2,}[- ]", n.get("content", ""))), None)
+        if following is None and cap.get('page number')==1:
+            size = float(cap.get('font size') or 0)
+            from .source_text import _known_inflection
+            following = next((n for n in nodes if n is not cap and not n.get('suppressed')
+                              and n.get('type')=='paragraph' and n.get('bounding box')
+                              and (body_size:=float(n.get('font size') or 0))>0 and size>=body_size*2.5
+                              and not re.search(r'Math|Symbol|Italic|Oblique|Courier|Mono',cap.get('font') or '',re.I)
+                              and 0<=n['bounding box'][0]-box[2]<=max(4,body_size*.6)
+                              and 0<=box[3]-n['bounding box'][3]<=body_size*2.5
+                              and box[1]<=n['bounding box'][1]
+                              and (word:=re.match(r'^[a-z]{2,}',n.get('content','')))
+                              and _known_inflection(text+word[0])),None)
         if following:
+            following['source drop cap'] = {'text':text,'box':list(box)}
             following["content"] = text+following["content"]
             following["bounding box"] = list(_union(box, following["bounding box"]))
             cap["suppressed"] = True
@@ -430,11 +518,35 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
         by_page[node.get("page number", 1)].append(node)
     repaired, sizes, spacing_repairs, link_repairs, front_spans = [], {}, [], [], []
     with _PDFIUM_LOCK, pdfium.PdfDocument(pdf_path) as pdf:
+        page_spans = {}
+        for index in range(len(pdf)):
+            page = pdf[index]
+            sizes[str(index+1)] = list(page.get_size())
+            if index + 1 in document.get('ocr pages', []):
+                page_spans[index + 1] = []
+                page.close()
+                continue
+            try:
+                page_spans[index + 1] = _spans(page)
+            finally:
+                page.close()
+        vocabulary = native_vocabulary(page_spans.values())
+        label_counts = Counter()
+        for node in nodes:
+            text,box = node.get('content',''),node.get('bounding box')
+            font,size = node.get('font') or '',float(node.get('font size') or 0)
+            height = sizes.get(str(node.get('page number',1)),[612,792])[1]
+            if (box and box[3] < height*.88 and not node.get('suppressed')
+                    and node.get('type') in {'paragraph','heading'}
+                    and re.search(r'Bold|Demi|Heavy',font,re.I)
+                    and re.fullmatch(r'[A-Za-z][A-Za-z -]{1,48}:?',text.strip())):
+                label_counts[(_canonical(text.strip())[0],font,round(size,1))] += 1
+        known_labels = {key for key,count in label_counts.items() if count>=2}
         for page_number in range(1, len(pdf) + 1):
             page = pdf[page_number - 1]
             try:
                 sizes[str(page_number)] = list(page.get_size())
-                spans = [] if page_number in document.get("ocr pages", []) else _spans(page)
+                spans = page_spans.pop(page_number)
                 if page_number == 1: front_spans = spans
                 textpage = page.get_textpage()
                 try:
@@ -447,9 +559,13 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
                     page_nodes = by_page.get(page_number, [])
                     if spans:
                         spans = remove_line_counters(page_nodes,spans,page.get_size()[0],page_number,document)
+                    accents = positioned_accents(page, spans) if spans else []
+                    wraps = line_wraps(page, spans, vocabulary) if spans else []
+                    word_spaces = geometric_word_spaces(spans) if spans else []
                     _join_drop_caps(page_nodes)
                     if spans:
-                        page_nodes.extend(_recover_uncovered_prose(page_nodes, spans, textpage, *page.get_size(), page_number))
+                        page_nodes.extend(_recover_uncovered_prose(page_nodes, spans, textpage,
+                                                                   *page.get_size(),page_number,known_labels))
                         page_nodes = [part for node in page_nodes for part in split_captions(node,spans,page.get_size()[0])]
                         page_nodes.extend(recover_tables(page,page_nodes,spans,textpage,page_number,document))
                     for node in page_nodes:
@@ -462,6 +578,18 @@ def repair_structure(pdf_path: Path, document: dict) -> dict:
                                 native = textpage.get_text_bounded(*node["bounding box"])
                                 node["content"], repairs = restore_printed_targets(node["content"], native, links)
                                 link_repairs.extend(dict(repair, page=page_number) for repair in repairs)
+                        if accents:
+                            for text_node in _nodes(node):
+                                normalize_accents(text_node,accents,page_number,document,textpage)
+                        if wraps:
+                            for text_node in _nodes(node):
+                                normalize_line_wraps(text_node,wraps,page_number,document)
+                        if spans:
+                            for text_node in _nodes(node):
+                                restore_local_spacing(text_node,textpage,page_number,document)
+                                normalize_geometric_spaces(text_node,word_spaces,page_number,document)
+                                restore_prose_dashes(text_node,textpage,page_number,document)
+                                restore_prose_omissions(text_node,textpage,spans,page_number,document)
                         text = node.get("content", "").strip()
                         if re.match(r"^(?:Disclaimer/)?Publisher['’]s Note\s*:",text,re.I):
                             node['type']='frontmatter'

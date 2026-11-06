@@ -103,9 +103,16 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
     pending_figure: Unit | None = None
     used = {"abstract", "summary", "full-text", "figures", "ocr-sources"}
     figure_count = 0
+    classified_abstract_seen = False
     image_sizes = {asset["source"]: asset.get("pixel size", ()) for asset in document.get("figures", [])}
 
     def append(unit: Unit) -> None:
+        nonlocal current
+        if current is None and classified_abstract_seen and not abstract_mode:
+            # Some papers start their body without an Introduction heading.
+            # Explicit source metadata still goes to article.front above.
+            current = Section('Full text',_slug('Full text',used))
+            article.sections.append(current)
         target = article.abstract if abstract_mode else current.units if current else article.front
         previous = next((other for other in reversed(target)
                          if unit.paragraph_id and other.paragraph_id == unit.paragraph_id), None)
@@ -130,6 +137,7 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
             pending_figure = None
             continue
         if chunk.kind in {"abstract", "abstract-image"}:
+            classified_abstract_seen = True
             if chunk.source.strip():
                 article.abstract.append(Unit(_ABSTRACT.sub("", chunk.source), _ABSTRACT.sub("", translated),
                                              kind="formula" if chunk.kind == "abstract-image" else "text", pages=chunk.pages))

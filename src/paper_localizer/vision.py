@@ -10,6 +10,8 @@ from io import BytesIO
 import json
 from pathlib import Path
 import re
+import tempfile
+import time
 import unicodedata
 import urllib.error
 import urllib.request
@@ -22,10 +24,12 @@ from .markup import FIGURE_LINK, image_reference
 from .tables import (TableError, parse_table, table_column_bounds, table_grid,
                      tables_agree, verify_table_text)
 from .native_math import native_expression
+from .math_fidelity import rendered_formula, source_symbols_agree, source_delimiters_agree
 
 
 VISION_VERSION = "glm-crops-4x-6x-v2"
 DEFAULT_VISION_MODEL = "glm-ocr:latest"
+_LIMIT_CACHE_SECONDS = 24 * 60 * 60
 
 
 class VisionOcrError(RuntimeError):
@@ -34,6 +38,39 @@ class VisionOcrError(RuntimeError):
 
 class _RegionTranscriptionError(VisionOcrError):
     """A model response failed for one crop; keep that source representation."""
+
+
+def _cached_generation_limit(path, identity):
+    try:
+        cached = json.loads(path.read_text(encoding='utf-8'))
+        age = time.time() - cached['created_at']
+        return (cached.get('identity') == identity and cached.get('done_reason') == 'length'
+                and 0 <= age < _LIMIT_CACHE_SECONDS)
+    except (OSError,ValueError,TypeError,KeyError):
+        return False
+
+
+def _cache_generation_limit(path, identity, result):
+    payload = {'identity':identity,'created_at':time.time(),'done_reason':'length',
+               'eval_count':result.get('eval_count'),
+               'reason':'The model reached its generation limit. Source representation retained.',
+               'maximum_age_seconds':_LIMIT_CACHE_SECONDS}
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w',encoding='utf-8',dir=path.parent,
+                                         prefix=path.stem+'-',suffix='.tmp',delete=False) as handle:
+            temporary = Path(handle.name)
+            json.dump(payload,handle,ensure_ascii=False)
+        temporary.replace(path)
+    except OSError:
+        # Cache availability must not change source-preserving OCR fallback.
+        return
+    finally:
+        if temporary is not None:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _request(url: str, path: str, body=None, timeout: int = 300):
@@ -67,10 +104,15 @@ def _strip_math_fence(text: str) -> str:
 
 def _latin_operands(text: str, latex: bool = False) -> Counter:
     if latex:
+        try:
+            text = rendered_formula(text)[0]
+            return Counter(re.findall(r'[A-Za-z0-9]',unicodedata.normalize('NFKC',text)))
+        except Exception:
+            pass
         text = re.sub(r"\\(?:begin|end)\{[^{}]*\}(?:\{[clr|\s]+\})?", "", text)
         text = re.sub(r"\\(log|ln|sin|cos|exp|Pr)\b", r"\1", text)
         text = re.sub(r"\\[A-Za-z]+", "", text)
-    return Counter(re.findall(r"[A-Za-z0-9]", text))
+    return Counter(re.findall(r"[A-Za-z0-9]", unicodedata.normalize('NFKC',text)))
 
 
 def _semantic_latex(text: str) -> str:
@@ -81,7 +123,7 @@ def _semantic_latex(text: str) -> str:
         body=match.group(2).strip()
         if re.fullmatch(r"(?:[A-Za-z]\s+)+[A-Za-z]",body):body=re.sub(r"\s+","",body)
         return "\\"+match.group(1)+"{"+body+"}"
-    return re.sub(r"\\(mathrm|text|mathit)\s*\{([^{}]*)\}",word,text)
+    return re.sub(r"\\(mathrm|text|mathit|operatorname)\s*\{([^{}]*)\}",word,text)
 
 
 def _prose_agrees(original: str, candidate: str) -> bool:
@@ -106,16 +148,33 @@ def _prose_consistent(first: str, second: str) -> bool:
             and Counter(re.findall(r"\d+(?:\.\d+)?", first)) == Counter(re.findall(r"\d+(?:\.\d+)?", second)))
 
 
+def _prose_words(text):
+    text = unicodedata.normalize("NFKC", text).casefold()
+    text = re.sub(r"(?<=[^\W\d_])-\s+(?=[^\W\d_])", "", text)
+    text = re.sub(r"\\[a-z]+", " ", text)
+    return [word for word in re.findall(r'[^\W\d_]+',text) if len(word)>=3]
+
+
 def _native_prose_preserved(original: str, candidate: str) -> bool:
     """Two agreeing OCR responses cannot override readable native prose."""
-    def words(text):
-        text = unicodedata.normalize("NFKC", text).lower()
-        text = re.sub(r"(?<=[a-z])-\s+(?=[a-z])", "", text)
-        text = re.sub(r"\\[a-z]+", " ", text)
-        return re.findall(r"\b[a-z]{3,}\b", text)
-    before, after = words(original), words(candidate)
+    before, after = _prose_words(original), _prose_words(candidate)
     numbers = lambda text: Counter(re.findall(r"\d+(?:\.\d+)?", text))
     return bool(before) and before == after and numbers(original) == numbers(candidate)
+
+
+def _native_crop_prose_preserved(spans, box, candidate):
+    """Also protect prose covered by a snapshot beyond its layout node's text.
+
+    Layout boxes can include the end of the preceding paragraph. Snapshot
+    reconciliation removes that duplicate prose, so dropping the snapshot must
+    account for these source words too. This check can only veto acceptance.
+    """
+    from .formulas import _inside, _MATH_FONT
+    expected = Counter(word for span in spans
+                       if span.font_name and not _MATH_FONT.search(span.font_name)
+                       and _inside(span.box, box, padding=0)
+                       for word in _prose_words(span.text))
+    return not (expected - Counter(_prose_words(candidate)))
 
 
 def _formula_signature(path: Path):
@@ -228,7 +287,8 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
     if expected_digest and entry["digest"].removeprefix("sha256:") != expected_digest.removeprefix("sha256:"):
         raise VisionOcrError(f"Vision OCR model digest differs from the requested version: {entry['digest']}")
     identity = {"profile": VISION_VERSION, "model": name, "digest": entry["digest"]}
-    digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:12]
+    source_sha256 = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+    digest = source_sha256[:12]
     cache_dir = output_dir / ".vision-cache" / digest
     cache_dir.mkdir(parents=True, exist_ok=True)
     details, math_text, sources, table_text = [], {}, [], {}
@@ -259,6 +319,14 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
             "stream": False, "keep_alive": "5m",
             "options": {"temperature": 0, "seed": 0, "num_predict": 4096, "num_ctx": 8192},
         }
+        failure_identity = {**key_data,'profile_failure':'generation-limit-v1',
+                            'source_sha256':source_sha256,'image_sha256':hashlib.sha256(buffer.getvalue()).hexdigest(),
+                            'url':url.rstrip('/'),'prompt':body['prompt'],'options':body['options']}
+        failure_cache = cache.with_suffix('.failed.json')
+        if _cached_generation_limit(failure_cache,failure_identity):
+            raise _RegionTranscriptionError(
+                'Vision OCR previously reached its token limit for this unchanged crop; '
+                'source retained. This failure is cached for up to 24 hours.')
         for attempt in range(2):
             try:
                 result = request(url, "/api/generate", body, timeout=timeout)
@@ -271,6 +339,8 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
             raise _RegionTranscriptionError("Vision OCR returned an invalid transcription.")
         text = result["response"].strip()
         if not text or result.get("done_reason") != "stop":
+            if text and result.get('done_reason') == 'length':
+                _cache_generation_limit(failure_cache,failure_identity,result)
             raise _RegionTranscriptionError("Vision OCR returned an empty or truncated transcription.")
         temporary = cache.with_suffix(".tmp")
         temporary.write_text(json.dumps({"identity": key_data, "text": text}, ensure_ascii=False), encoding="utf-8")
@@ -285,7 +355,8 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
             page = pdf[page_number-1]
             try:
                 from .formulas import _spans, _inside
-                page_spans = _spans(page)
+                from .source_text import normalized_spans
+                page_spans = normalized_spans(_spans(page), document, page_number)
                 for node in nodes:
                     if node.get("page number") != page_number or node.get("suppressed"):
                         continue
@@ -317,12 +388,20 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
                             accepted = valid_math(second) and _prose_consistent(candidate, second)
                             if accepted:
                                 reason = "two resolutions agree; original OCR disagreed"
-                        if accepted and node.get("font") != "OCR" and not _native_prose_preserved(original, candidate):
-                            accepted = False
-                            reason = "native prose was omitted or adjacent prose was added; source retained"
+                        crop_prose_preserved = None
+                        if accepted and node.get("font") != "OCR":
+                            if not _native_prose_preserved(original, candidate):
+                                accepted = False
+                                reason = "native prose was omitted or adjacent prose was added; source retained"
+                            else:
+                                crop_prose_preserved = _native_crop_prose_preserved(page_spans, box, candidate)
+                                if not crop_prose_preserved:
+                                    accepted = False
+                                    reason = "readable native words in the complete source crop were omitted; source retained"
                         details.append({"page": page_number, "kind": "prose", "accepted": accepted,
                                         "box": box, "reason": reason, "original": original,
-                                        "candidate": candidate, "second": second})
+                                        "candidate": candidate, "second": second,
+                                        "native_crop_prose_preserved": crop_prose_preserved})
                         if accepted:
                             snapshot = node.pop("formula snapshot", "")
                             if snapshot:
@@ -380,14 +459,25 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
                     accepted = _math_key(first) == _math_key(second) and valid_math("$$"+first+"$$")
                     native_available = bool(local) and all(span.font_name for span in local) and native_mapping_valid
                     native_agrees = not native_available or _latin_operands(native) == _latin_operands(first, latex=True)
-                    accepted = accepted and native_agrees
+                    symbols_agree = source_symbols_agree(native,first) if native_available else None
+                    accepted = accepted and native_agrees and symbols_agree is not False
+                    delimiters_agree = (source_delimiters_agree(output_dir/asset['source'],first)
+                                        if accepted and symbols_agree is None else None)
+                    accepted = accepted and delimiters_agree is not False
                     details.append({"page": page_number, "kind": "formula", "source": asset["source"],
                                     "accepted": accepted, "first": first, "second": second,
                                     "native_operands_agree": native_agrees,
                                     "native_operands_available": native_available,
+                                    'native_symbols_available':symbols_agree is not None,
+                                    'native_symbols_agree':symbols_agree,
+                                    'source_delimiter_strokes_agree':delimiters_agree,
                                     "reason": (("two resolutions and native operands agree" if native_available else
                                                 "two resolutions agree; native operands unavailable") + escalation
-                                               if accepted else "transcriptions or native operands disagree; image retained")})
+                                               if accepted else ('explicit native symbols or decimal values disagree; image retained'
+                                                                 if symbols_agree is False else
+                                                                 'OCR delimiters lack supporting source strokes; image retained'
+                                                                 if delimiters_agree is False else
+                                                                 "transcriptions or native operands disagree; image retained"))})
                     if accepted:
                         math_text[asset["source"]] = first
                 for asset in document.get("figures", []):
@@ -431,7 +521,9 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
     try:
         for detail in details:
             if (detail["kind"]!="formula" or detail["accepted"] or not detail.get("second")
-                    or not detail.get("native_operands_agree",True)):continue
+                    or not detail.get("native_operands_agree",True)
+                    or detail.get('native_symbols_agree') is False
+                    or detail.get('source_delimiter_strokes_agree') is False):continue
             candidates={_math_key(detail["first"]),_math_key(detail["second"])}
             signature=_formula_signature(output_dir/detail["source"])
             if not signature:continue
@@ -445,7 +537,7 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
     finally:
         for _,_,template in templates:
             if template:template[0].close()
-    document["vision ocr"] = {**identity, "acceptance_profile": "native-prose-preservation-v1",
+    document["vision ocr"] = {**identity, "acceptance_profile": "native-prose-and-symbols-v3",
                               "source_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(), "regions": details}
     document["math transcriptions"] = {source:_semantic_latex(text) for source,text in math_text.items()}
     document["table transcriptions"] = table_text

@@ -15,6 +15,25 @@ from test_structure import fixture_pdf,paragraph
 
 
 class ReviewLayoutTests(unittest.TestCase):
+    def test_advance_only_type3_glyphs_do_not_become_phantom_equations(self):
+        textpage = Mock()
+        textpage.count_chars.return_value = 1
+        textpage.get_charbox.return_value = (30,400,80,400.00009)
+        obj = textpage.get_textobj.return_value
+        obj.raw = ctypes.c_void_p(1)
+        obj.get_font.return_value.get_base_name.return_value = ''
+        obj.get_font_size.return_value = .1
+        obj.get_matrix.return_value = SimpleNamespace(c=0,d=1,f=400)
+        page = Mock()
+        page.get_textpage.return_value = textpage
+        with patch('paper_localizer.formulas.pdfium.raw.FPDFText_GetUnicode',return_value=3):
+            self.assertEqual(_spans(page),[])
+        textpage.get_charbox.return_value = (30,400,38,400.25)
+        obj.get_font.return_value.get_base_name.return_value = 'CMSY10'
+        obj.get_font_size.return_value = 10
+        with patch('paper_localizer.formulas.pdfium.raw.FPDFText_GetUnicode',return_value=ord('−')):
+            self.assertEqual(_spans(page)[0].text,'−')
+
     def test_palatino_ital_font_marks_single_letter_variables(self):
         textpage=Mock();textpage.count_chars.return_value=1
         textpage.get_charbox.return_value=(30,400,38,410)

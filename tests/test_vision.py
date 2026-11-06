@@ -1,4 +1,5 @@
 from pathlib import Path
+from copy import deepcopy
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -11,9 +12,133 @@ from paper_localizer.ocr import _math_line
 from paper_localizer.vision import (_math_key, _prose_agrees, _prose_consistent,
     _formula_signature, _same_short_formula, refine_document, VisionOcrError)
 from test_formulas import math_fixture
+from test_structure import fixture_pdf
 
 
 class VisionTests(unittest.TestCase):
+    def test_snapshot_ocr_cannot_omit_native_prose_outside_its_original_text(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root/'source.pdf'
+            preceding = 'We begin by defining conditions for miner stability.'
+            heading = 'Proposition One describes the stable network topology.'
+            fixture_pdf(pdf, [b'BT /F2 10 Tf 30 520 Td ('+preceding.encode()+b') Tj ET '
+                              b'BT /F2 10 Tf 30 500 Td ('+heading.encode()+b') Tj ET'])
+            source = 'figs/source/paragraph.png'
+            (root/source).parent.mkdir(parents=True)
+            Image.new('RGB',(500,80),'white').save(root/source)
+            box = [29,495,400,530]
+            document = {'kids':[{'type':'paragraph','page number':1,'font':'Times-Roman',
+                                'content':heading,'bounding box':box,
+                                'formula snapshot':f'![Source]({source})'}],
+                        'formulas':[{'source':source,'page number':1,'bounding box':box,'block':True}]}
+            def request(url,path,body=None,**kwargs):
+                return ({'models':[{'name':'glm-ocr:latest','digest':'model'}]} if path=='/api/tags'
+                        else {'response':heading,'done_reason':'stop'})
+            refine_document(pdf,document,root,model='glm-ocr:latest',url='http://localhost:11434',requester=request)
+            region = document['vision ocr']['regions'][0]
+            self.assertFalse(region['accepted'])
+            self.assertFalse(region['native_crop_prose_preserved'])
+            self.assertIn('complete source crop',region['reason'])
+            self.assertIn('formula snapshot',document['kids'][0])
+            self.assertEqual(document['vision sources'],[])
+
+    def test_agreeing_model_responses_cannot_add_source_absolute_value_bars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf = root/'source.pdf'
+            fixture_pdf(pdf,[b'BT /F1 12 Tf 30 500 Td (x+y) Tj ET'])
+            source = 'figs/source/expression.png'
+            (root/source).parent.mkdir(parents=True)
+            import pypdfium2 as pdfium
+            with pdfium.PdfDocument(pdf) as pages:
+                page = pages[0]
+                w,h = page.get_size()
+                bitmap = page.render(scale=2,crop=(29,495,w-80,h-515))
+                bitmap.to_pil().save(root/source)
+                bitmap.close()
+            doc = {'kids':[{'type':'formula','page number':1,'content':f'![Eq]({source})',
+                            'formula image':True,'bounding box':[29,495,80,515]}],
+                   'formulas':[{'page number':1,'source':source,'bounding box':[29,495,80,515]}]}
+            def request(url,path,body=None,**kwargs):
+                return ({'models':[{'name':'glm-ocr:latest','digest':'model'}]} if path=='/api/tags' else
+                        {'response':r'\left|x+y\right|','done_reason':'stop'})
+            with patch('paper_localizer.vision.native_expression',return_value=None):
+                refine_document(pdf,doc,root,model='glm-ocr:latest',url='http://localhost:11434',requester=request)
+            self.assertEqual(doc['math transcriptions'],{})
+            detail = doc['vision ocr']['regions'][0]
+            self.assertTrue(detail['native_operands_agree'])
+            self.assertFalse(detail['native_symbols_agree'])
+            self.assertFalse(detail['accepted'])
+            self.assertIn('image retained',detail['reason'])
+
+    def test_native_prose_preserves_accented_author_names(self):
+        from paper_localizer.vision import _native_prose_preserved
+        source = 'The authors Díaz and Erdős describe the complete protocol.'
+        self.assertTrue(_native_prose_preserved(source,source))
+        self.assertFalse(_native_prose_preserved(source,source.replace('Díaz','Níaz')))
+        self.assertFalse(_native_prose_preserved(source,source.replace('Erdős','Erdos')))
+
+    def equation_document(self,root):
+        pdf = root/'source.pdf'
+        math_fixture(pdf)
+        source = 'figs/test/equation.png'
+        (root/source).parent.mkdir(parents=True)
+        Image.new('RGB',(50,30),'white').save(root/source)
+        return pdf, {'kids':[{'type':'formula','page number':1,'content':f'![Eq]({source})',
+                              'formula image':True,'bounding box':[80,60,110,75]}],
+                     'formulas':[{'page number':1,'source':source,'bounding box':[80,60,110,75]}]}
+
+    def test_generation_limit_reuses_unchanged_failure_then_retries_after_expiry(self):
+        from paper_localizer.vision import _LIMIT_CACHE_SECONDS
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pdf,original = self.equation_document(root)
+            calls = []
+            digest = 'original-model'
+            def request(url,path,body=None,**kwargs):
+                if path=='/api/tags':
+                    return {'models':[{'name':'glm-ocr:latest','digest':digest}]}
+                calls.append(body['options'])
+                return {'response':'unfinished transcription','done_reason':'length','eval_count':4096}
+            def run(now):
+                doc = deepcopy(original)
+                with patch('paper_localizer.vision.time.time',return_value=now):
+                    refine_document(pdf,doc,root,model='glm-ocr:latest',url='http://localhost:11434',requester=request)
+                self.assertFalse(doc['vision ocr']['regions'][0]['accepted'])
+                self.assertEqual(doc['kids'][0]['content'],original['kids'][0]['content'])
+                return doc
+            run(1000)
+            self.assertEqual(len(calls),1)
+            cached = run(1001)
+            self.assertEqual(len(calls),1)
+            self.assertIn('cached',cached['vision ocr']['regions'][0]['reason'])
+            run(1000+_LIMIT_CACHE_SECONDS+1)
+            self.assertEqual(len(calls),2)
+            digest = 'updated-model'
+            run(1002)
+            self.assertEqual(len(calls),3)
+            self.assertTrue(list((root/'.vision-cache').rglob('*.failed.json')))
+
+    def test_network_and_empty_responses_remain_retryable(self):
+        for failure in ['network','empty']:
+            with self.subTest(failure=failure),tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                pdf,original = self.equation_document(root)
+                calls = []
+                def request(url,path,body=None,**kwargs):
+                    if path=='/api/tags':
+                        return {'models':[{'name':'glm-ocr:latest','digest':'model'}]}
+                    calls.append(path)
+                    if failure=='network':
+                        raise VisionOcrError('Temporary connection error')
+                    return {'response':'','done_reason':'stop'}
+                for _ in range(2):
+                    refine_document(pdf,deepcopy(original),root,model='glm-ocr:latest',
+                                    url='http://localhost:11434',requester=request)
+                self.assertEqual(len(calls),4 if failure=='network' else 2)
+                self.assertFalse(list((root/'.vision-cache').rglob('*.failed.json')))
+
     def test_incomplete_region_response_preserves_source_and_records_failure(self):
         for response in ({"response": "$$x", "done_reason": "length"},
                          {"response": "", "done_reason": "stop"},

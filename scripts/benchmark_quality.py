@@ -15,6 +15,7 @@ from markdown_it import MarkdownIt
 from paper_localizer.core import extract_blocks, make_chunks
 from paper_localizer.figures import _nodes
 from paper_localizer.vision import _math_key
+from paper_localizer.markup import FIGURE_LINK,image_reference
 
 
 def main():
@@ -52,8 +53,11 @@ def main():
     caption=next(n for n in nodes('pastry') if n.get('type')=='caption' and n.get('caption label')=='Fig. 7')
     check('Fig.7 caption retains three parameter images',caption.get('content','').count('<img')==3 and '5,000 nodes' in caption.get('content',''),'Pastry p.16')
     parameter_text=documents['pastry'].get('math transcriptions',{})
-    for suffix,letter,value in [('003','b','4'),('004','L','16'),('005','M','32')]:
-        text=next((text for source,text in parameter_text.items() if f'page-016-math-{suffix}' in source),'')
+    parameter_sources=[image_reference(match).source for match in FIGURE_LINK.finditer(caption.get('content',''))]
+    # Image ordinals change when phantom glyphs or unrelated earlier crops
+    # disappear. The caption's three owned regions are the stable evidence.
+    for index,(letter,value) in enumerate([('b','4'),('L','16'),('M','32')]):
+        text=parameter_text.get(parameter_sources[index],'') if index<len(parameter_sources) else ''
         check(f'Fig.7 {letter}={value} reaches text models',letter in text and value in re.sub(r'\s+','',text),'Pastry p.16')
     probability_rows=[]
     for q,z,expected in [(0.1,1,.2045873),(0.1,6,.0002428),(0.1,10,.0000012),(0.3,5,.1773523),(0.3,20,.0024804),(0.3,50,.0000006)]:

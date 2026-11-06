@@ -33,7 +33,10 @@ def nodes(document, page=1):
 def canonical(text):
     text = FIGURE_LINK.sub("", text)
     text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)
-    return "".join(c for c in unicodedata.normalize("NFKC", text).casefold() if c.isalnum())
+    # Native TeX marks can be separate glyphs while the reading edition uses
+    # composed Unicode. Count their base letters consistently; typography is
+    # verified separately from this character-preservation diagnostic.
+    return "".join(c for c in unicodedata.normalize("NFKD", text.replace('ı','i')).casefold() if c.isalnum())
 
 
 def inside(glyph, box, padding=.5):
@@ -44,11 +47,20 @@ def source_glyphs(page):
     text = page.get_textpage()
     glyphs = []
     try:
-        for index in range(text.count_chars()):
+        count = text.count_chars()
+        skip_low = False
+        for index in range(count):
+            if skip_low:
+                skip_low = False
+                continue
             code = pdfium.raw.FPDFText_GetUnicode(text, index)
-            if 0 < code <= 32: continue
+            if 0xd800<=code<=0xdbff and index+1<count:
+                low = pdfium.raw.FPDFText_GetUnicode(text,index+1)
+                if 0xdc00<=low<=0xdfff:
+                    code = 0x10000+((code-0xd800)<<10)+low-0xdc00
+                    skip_low = True
             box = text.get_charbox(index)
-            if box[0] == box[2] or box[1] == box[3]: continue
+            if box[0] == box[2] or box[3]-box[1] < .01: continue
             char = chr(code) if 0 < code <= 0x10FFFF else "\ufffd"
             obj = text.get_textobj(index)
             baseline = obj.get_matrix().f if obj is not None else (box[1]+box[3])/2
@@ -65,7 +77,7 @@ def repeated_margin_text(pages, sizes):
         height = sizes[number][1]
         lines = defaultdict(list)
         for glyph in glyphs:
-            side = "bottom" if glyph["y"] < height*.06 else "top" if glyph["y"] > height*.94 else ""
+            side = "bottom" if glyph["y"] < height*.06 else "top" if glyph["y"] > height*.90 else ""
             if side: lines[side, round(glyph["baseline"], 0)].append(glyph)
         for (side, _), line in lines.items():
             text = "".join(g["char"] for g in sorted(line, key=lambda g: g["x"]))
@@ -82,6 +94,18 @@ def content_coverage(document, article_path, pages, sizes):
     contents = article_path.read_text(encoding="utf-8") + article_path.with_suffix(".html").read_text(encoding="utf-8")
     active = {image_reference(match).source for match in FIGURE_LINK.finditer(contents)}
     assets = document.get("figures", []) + document.get("formulas", [])
+    # Full original OCR pages are retained in the comparison appendix. Count
+    # that image preservation separately from editable/semantic OCR accuracy.
+    assets += [{'source':a['source'],'page number':a['page'],'bounding box':[0,0,*sizes[a['page']]]}
+               for a in document.get('ocr sources',[]) if a.get('page') in sizes]
+    assets_by_page,excluded_by_page,counters_by_page = defaultdict(list),defaultdict(list),defaultdict(list)
+    for asset in assets:
+        if asset['source'] in active:
+            assets_by_page[asset['page number']].append(asset)
+    for asset in document.get('excluded artwork',[]):
+        excluded_by_page[asset['page number']].append(asset)
+    for counter in document.get('review line numbers',[]):
+        counters_by_page[counter['page']].append(counter)
     by_page = defaultdict(list)
     for node, number in nodes(document):
         if node.get("content") and not node.get("suppressed"): by_page[number].append(node)
@@ -100,14 +124,18 @@ def content_coverage(document, article_path, pages, sizes):
     for number, glyphs in pages.items():
         ignored = set(furniture[number])
         visual = set()
+        local_assets = [a for a in assets_by_page[number] if a['source'] not in invalid_assets]
+        local_excluded = excluded_by_page[number]
+        review_counters = set()
+        margin_nodes = [n for n in by_page[number] if n.get('type') in {'header','footer'}]
         for glyph in glyphs:
-            if any(n.get("type") in {"header", "footer"} and inside(glyph, n.get("bounding box")) for n in by_page[number]):
+            if any(inside(glyph,n.get('bounding box')) for n in margin_nodes):
                 ignored.add(glyph["index"])
-            if any(a["page number"] == number and inside(glyph, a["bounding box"])
-                   for a in document.get("excluded artwork", [])):
+            if any(inside(glyph,a['bounding box']) for a in local_excluded):
                 ignored.add(glyph["index"])
-            if any(a["page number"] == number and a["source"] in active and a["source"] not in invalid_assets
-                   and inside(glyph, a["bounding box"], padding=0) for a in assets):
+            if any(inside(glyph,c['box'],padding=0) for c in counters_by_page[number]):
+                ignored.add(glyph['index']);review_counters.add(glyph['index'])
+            if any(inside(glyph,a['bounding box'],padding=0) for a in local_assets):
                 visual.add(glyph["index"])
         units = {}
         for glyph in glyphs:
@@ -146,6 +174,7 @@ def content_coverage(document, article_path, pages, sizes):
                        "caption_abbreviation_units": len(normalized),
                        "unmatched_snippets": snippets, "image_preserved_glyphs": len(visual),
                        "furniture_glyphs": len(ignored), "undecodable_glyphs": len(opaque),
+                       "review_counter_glyphs":len(review_counters),
                        "undecodable_glyphs_preserved_as_images": sum(g["index"] in visual for g in opaque)})
     return result, invalid_assets
 
@@ -168,6 +197,14 @@ def write_review(pdf_path, document, article_path, output):
     blocks = core.extract_blocks(document)
     for number in pages:
         page_blocks = [b for b in blocks if number in (b.source_pages or (b.page,))]
+        if number>1:
+            first_body = next((b for b in page_blocks if b.kind not in {
+                'frontmatter','abstract','abstract-image','keywords'}),None)
+            if first_body is not None and first_body.kind!='heading':
+                # A standalone pane lacks the heading from the preceding
+                # source page. Keep its continued body visible in the pane.
+                page_blocks.insert(page_blocks.index(first_body),core.Block(
+                    number,'heading',f'## Source page {number}'))
         page_document = {"number of pages": 1, "figures": document.get("figures", []),
                          "table transcriptions": document.get("table transcriptions", {}),
                          "source links": [link for link in document.get("source links", [])
@@ -177,6 +214,7 @@ def write_review(pdf_path, document, article_path, output):
     article = build_article(document, core._document_title(document, pdf_path.name), pdf_path.name, core.make_chunks(blocks))
     graphics = document.get("figures", [])
     report = {"generated_at": datetime.now(timezone.utc).isoformat(), "source_pdf": str(pdf_path.resolve()),
+              "review_engine_sha256":hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "source_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(), "article": str(article_path.resolve()),
               "pages": len(pages), "figures": sum(a.get("asset kind", "figure") == "figure" for a in graphics),
               "tables": sum(a.get("asset kind") == "table" for a in graphics),

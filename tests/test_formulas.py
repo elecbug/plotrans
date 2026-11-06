@@ -64,6 +64,38 @@ def math_fixture(path: Path) -> dict:
 
 
 class FormulaTests(unittest.TestCase):
+    def test_math_font_bullet_does_not_turn_an_italic_list_label_into_a_formula(self):
+        from test_structure import fixture_pdf,paragraph
+        from paper_localizer.formulas import _spans
+        import pypdfium2 as pdfium
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'list.pdf'
+            fixture_pdf(source,[b'BT /F5 10 Tf 30 500 Td (\267) Tj ET '
+                                b'BT /F1 10 Tf 40 500 Td (Pruning.) Tj ET '
+                                b'BT /F2 10 Tf 80 500 Td (Peers keep the complete source prose.) Tj ET'])
+            with pdfium.PdfDocument(source) as pdf:
+                spans = _spans(pdf[0])
+                self.assertTrue(any(s.text=='•' for s in spans))
+                self.assertFalse(any(s.math for s in spans))
+            doc = {'kids':[paragraph('• Pruning. Peers keep the complete source prose.',[29,490,300,515])]}
+            recover_formulas(source,doc,root)
+            self.assertFalse(doc.get('formulas'))
+            self.assertIn('Pruning.',doc['kids'][0]['content'])
+
+    def test_a_bullet_used_between_mathematical_variables_remains_in_the_expression(self):
+        from test_structure import fixture_pdf,paragraph
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'product.pdf'
+            fixture_pdf(source,[b'BT /F1 10 Tf 30 500 Td (x) Tj ET '
+                                b'BT /F5 10 Tf 38 500 Td (\267) Tj ET '
+                                b'BT /F1 10 Tf 46 500 Td (y) Tj ET'])
+            doc = {'kids':[paragraph('x•y',[29,490,80,515])]}
+            recover_formulas(source,doc,root)
+            self.assertEqual(len(doc.get('formulas',[])),1)
+            self.assertTrue(doc['kids'][0].get('formula snapshot') or '<img' in doc['kids'][0]['content'])
+
     def test_inline_crop_keeps_source_space_before_a_citation(self):
         from test_structure import fixture_pdf, paragraph
         with tempfile.TemporaryDirectory() as directory:

@@ -76,6 +76,8 @@ def _spans(page) -> list[TextSpan]:
             # seeds. Cropping `p =` out of a C declaration destroys the program.
             if re.search(r"Courier|Mono|Consolas", first.font_name, re.I):
                 seed = False
+            if text in {'•','◦','▪','‣'}:
+                seed = False
             result.append(TextSpan(first.index, text, box, seed, max(s.font_size for s in pending),
                                    first.baseline, first.font_name))
         pending, category = [], ""
@@ -109,7 +111,10 @@ def _spans(page) -> list[TextSpan]:
                 flush(); continue
             if not text.isprintable() and not undecodable: continue
             box = tuple(textpage.get_charbox(index))
-            if not _area(box): continue
+            # Type3 advance-only glyphs can acquire a tiny positive height
+            # from floating-point transforms. They contain no ink and must
+            # not become orphan equation images of neighboring descenders.
+            if not _area(box) or box[3]-box[1] < .01: continue
             if text.isspace(): text = "\ufffd"
             kind = "word" if text.isalpha() else "number" if text.isdigit() else text
             decimal = text == "." and category == "number" and index + 1 < count and chr(
@@ -166,7 +171,7 @@ def _expand_expressions(spans: list[TextSpan]) -> list[TextSpan]:
         return (span.math or span.index in identifiers or text in _FUNCTIONS or text.replace(".", "").isdigit()
                 or (len(text) == 1 and text.isalpha())
                 or (text.isalpha() and bool(re.search("Italic|Oblique|Ital$|It$", span.font_name, re.I)))
-                or all(char in "+-=–*/^_()[]{}<>|,:;≤≥≈≠∞·×÷∈∉∪∩…" for char in text)
+                or all(char in "+-=–*/^_()[]{}<>|,:;≤≥≈≠∞·×÷∈∉∪∩…•◦▪‣" for char in text)
                 or text == "...")
 
     def connected(a: TextSpan, b: TextSpan) -> bool:
@@ -262,6 +267,16 @@ def _plain_text_group(group: list[TextSpan], node: dict) -> bool:
     content = node.get("content", "").lstrip()
     if text in {"•", "◦", "▪", "‣"} and content.startswith(text):
         return True
+    # Mapped arrows/minus signs often come from CMSY even in simple numeric
+    # tables. Keep a complete, flat, source-matching cell editable. A raised
+    # exponent or stacked fraction fails the baseline/size checks.
+    if (node.get('native table cell') and re.fullmatch(r'[\d.,%()+*/=<>×÷−–→↔ -]+',text)
+            and _canonical(content)[0] in {_canonical(text)[0],_canonical(text)[0]+'%'}
+            and all(s.font_name for s in group)
+            and min(s.font_size for s in group) >= max(s.font_size for s in group)*.95
+            and max(s.baseline for s in group)-min(s.baseline for s in group)
+                <= max(s.font_size for s in group)*.12):
+        return True
     if any(not span.font_name or _MATH_FONT.search(span.font_name) for span in group):
         return False
     if node.get("type") == "heading" and (label := re.match(r"([A-Z])\.\s", content)):
@@ -272,8 +287,6 @@ def _plain_text_group(group: list[TextSpan], node: dict) -> bool:
     if min(sizes) < max(sizes) * .95 or max(baselines) - min(baselines) > max(sizes) * .12:
         return False
     if node.get('type')=='heading' and re.fullmatch(r'[A-Za-z]',text):
-        return True
-    if node.get("native table cell") and re.fullmatch(r"[\d.,%()+*/=<>×÷−– -]+", text):
         return True
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9.]*", text):
         return False
@@ -418,6 +431,7 @@ def _reconcile_snapshots(nodes: list[dict], spans: list[TextSpan], assets: list[
     only the snapshot's originating node leaves the other two on screen.
     """
     regions = {a["source"]: tuple(a["bounding box"]) for a in assets if a.get("block")}
+    inline_regions = {a['source']:tuple(a['bounding box']) for a in assets if not a.get('block')}
     owners = []
     for node in nodes:
         markup = node.get("formula snapshot") or (node.get("content", "") if node.get("formula image") else "")
@@ -446,9 +460,85 @@ def _reconcile_snapshots(nodes: list[dict], spans: list[TextSpan], assets: list[
                 suppressed.add(id(node)); changed += 1
         # Partial paragraph overlap is removed by ordinary-text anchors rather
         # than dropping prose outside the snapshot's visible bounds.
+        for node in nodes:
+            if (node is owner or node.get('suppressed') or node.get('formula snapshot')
+                    or node.get('native table cell') or node.get('type') not in {
+                        'paragraph','list item','abstract','footnote','frontmatter'}):
+                continue
+            def retire_covered_inline(match):
+                source = image_reference(match).source
+                box = inline_regions.get(source)
+                if box and _intersection(box,region)/max(_area(box),1)>=.98:
+                    node.setdefault('source inline regions covered by snapshot',[]).append({
+                        'source':source,'box':list(box),'snapshot':owner.get('formula snapshot') or owner.get('content','')})
+                    return ' '
+                return match[0]
+            node['content'] = FIGURE_LINK.sub(retire_covered_inline,node.get('content',''))
         partial = [n for n in nodes if n is not owner and id(n) not in suppressed
                    and not n.get("formula snapshot") and not FIGURE_LINK.search(n.get("content", ""))]
         changed += _remove_figure_duplicates(partial, spans, [region], preserve_captions=False)
+    return changed
+
+
+def _merge_overlapping_prose_snapshots(nodes, spans, assets, save, textpage):
+    """Keep an overlapping prose continuation whole in one source snapshot.
+
+    An inline crop inside another paragraph's snapshot proves duplicate source
+    ownership. Merely deleting that continuation would lose its outside prose.
+    Limit expansion to the same column and twice the original snapshot area.
+    """
+    regions = {a['source']:tuple(a['bounding box']) for a in assets}
+    prose = {'paragraph','list item','abstract','footnote','frontmatter'}
+    barriers = [n for n in nodes if n.get('type') in {'heading','caption','table','code','image','picture'}
+                and not n.get('suppressed') and _box(n)
+                and (n.get('type')!='table' or any(c.get('content') or c.get('formula snapshot') for c in _nodes(n)))]
+    owners = []
+    for node in nodes:
+        if (node.get('suppressed') or node.get('type') not in prose or node.get('native table cell')
+                or node.get('source display equation') or node.get('source display definition')):
+            continue
+        match = next(FIGURE_LINK.finditer(node.get('formula snapshot','')),None)
+        if match and (source:=image_reference(match).source) in regions:
+            owners.append((node,regions[source]))
+    changed = 0
+    for owner,initial in sorted(owners,key=lambda item:_area(item[1]),reverse=True):
+        if owner.get('suppressed'):
+            continue
+        region = initial
+        members = []
+        size = float(owner.get('font size') or 9)
+        while True:
+            added = False
+            for node in nodes:
+                if (node is owner or node in members or node.get('suppressed') or node.get('type') not in prose
+                        or node.get('native table cell') or node.get('formula snapshot') or not (box:=_box(node))):
+                    continue
+                refs = [regions.get(image_reference(m).source) for m in FIGURE_LINK.finditer(node.get('content',''))]
+                if not any(b and _intersection(b,region)/max(_area(b),1)>=.98 for b in refs):
+                    continue
+                if abs(box[0]-initial[0])>max(12,size*3) or abs(box[2]-initial[2])>max(12,size*3):
+                    continue
+                combined = _union(region,box)
+                for span in spans:
+                    if _inside(span.box,box,padding=.5):
+                        combined = _union(combined,span.box)
+                if _area(combined)>_area(initial)*2:
+                    continue
+                if any(_intersection(combined,_box(n))>_intersection(initial,_box(n))+.5 for n in barriers):
+                    continue
+                members.append(node);region=combined;added=True
+            if not added:
+                break
+        if not members:
+            continue
+        owner['source merged paragraph fragments'] = [owner.get('content','')]+[n.get('content','') for n in members]
+        owner['content'] = ' '.join(textpage.get_text_bounded(*region).split())
+        owner['bounding box'] = list(region)
+        owner['formula snapshot'] = save(region,block=True,complete=False)
+        for node in members:
+            node['content']='';node['suppressed']=True
+            node['covered by source snapshot']=owner['formula snapshot']
+            changed += 1
     return changed
 
 
@@ -508,6 +598,19 @@ def _complete_region(box: Box, nodes: list[dict]) -> Box:
                 box = combined
         if box == previous:
             return box
+
+
+def _complete_prose_words(box: Box, spans: list[TextSpan]) -> Box:
+    """Keep an ordinary word whole before its covered text is deduplicated."""
+    original = box
+    for span in spans:
+        if (not span.math and span.font_name and not _MATH_FONT.search(span.font_name)
+                and not re.search(r'Courier|Mono|Consolas',span.font_name,re.I)
+                and len(span.text)>=2 and all(c.isalpha() and ('LATIN' in unicodedata.name(c,'')
+                                                                   or ord(c)<128) for c in span.text)
+                and _inside(span.box,original,padding=0)):
+            box = _union(box,span.box)
+    return box if _area(box)<=max(_area(original),1)*1.25 else original
 
 
 def _recover_code(page, nodes: list[dict]) -> None:
@@ -617,7 +720,9 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     continue
                 width, height = page.get_size()
                 from .review_layout import filter_counters
+                from .source_text import normalized_spans
                 spans = filter_counters(_spans(page),document,page_number)
+                spans = normalized_spans(spans,document,page_number)
                 undecoded = sum(not s.font_name for s in spans)
                 if spans and undecoded / len(spans) > .75:
                     # Some old PDFs encode *all prose* as custom Type3 glyphs.
@@ -681,11 +786,14 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     nodes, spans, [_group_box(group) for group in orphan_groups], preserve_captions=False)
                 counter = 0
 
-                def save(box: Box, *, block: bool = False, metrics: tuple[float, float] | None = None) -> str:
+                def save(box: Box, *, block: bool = False, metrics: tuple[float, float] | None = None,
+                         complete: bool = True, prose: bool = False) -> str:
                     nonlocal counter
                     counter += 1
-                    if block:
+                    if block and complete:
                         box = _complete_region(box, nodes)
+                    if block and prose:
+                        box = _complete_prose_words(box,spans)
                     left, bottom, right, top = box
                     left, bottom = max(0, left - 0.4), max(0, bottom - 1.0)
                     right, top = min(width, right + 0.4), min(height, top + 1.0)
@@ -732,7 +840,10 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                         # rather than insert an equation into an unrelated sentence.
                         whole_box = node_box
                         for group in groups: whole_box = _union(whole_box, _group_box(group))
-                        snapshot = save(whole_box, block=True)
+                        snapshot = save(whole_box, block=True,prose=(
+                            not node.get('native table cell') and node.get('type') in {
+                                'paragraph','list item','abstract','footnote','frontmatter'}
+                            and len(re.findall(r'\b[A-Za-z]{3,}\b',node.get('content','')))>=4))
                         node["formula snapshot"] = snapshot
                         continue
                     content = node["content"]
@@ -772,6 +883,12 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 for node in nodes:
                     _split_mixed_heading(node, spans)
                 page_nodes = [n for n in _nodes(document) if n.get("page number") == page_number]
+                textpage = page.get_textpage()
+                try:
+                    document['merged overlapping prose fragments'] = document.get('merged overlapping prose fragments',0) + _merge_overlapping_prose_snapshots(
+                        page_nodes,spans,[a for a in formulas if a['page number']==page_number],save,textpage)
+                finally:
+                    textpage.close()
                 document["deduplicated equation text"] = document.get("deduplicated equation text", 0) + _reconcile_snapshots(
                     page_nodes, spans, [a for a in formulas if a["page number"] == page_number])
                 document["merged legacy equation fragments"] = document.get("merged legacy equation fragments", 0) + _merge_legacy_equation_snapshots(
