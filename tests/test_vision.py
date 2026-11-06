@@ -164,6 +164,22 @@ class VisionTests(unittest.TestCase):
                 self.assertIn("retained", document["vision ocr"]["regions"][0]["reason"])
                 self.assertTrue((root / source).is_file())
 
+    def test_table_captioned_code_listing_is_not_transcribed_as_a_data_grid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);pdf=root/'source.pdf';math_fixture(pdf)
+            document={'kids':[], 'figures':[{'page number':1,'source':'figs/test/code.png',
+                      'asset kind':'table','source listing':True,'bounding box':[30,60,180,120]}]}
+            calls=[]
+            def request(url,path,body=None,**kwargs):
+                calls.append(path)
+                if path!='/api/tags':
+                    self.fail('Code listing was sent to tabular OCR.')
+                return {'models':[{'name':'glm-ocr:latest','digest':'model'}]}
+            refine_document(pdf,document,root,model='glm-ocr:latest',url='http://localhost:11434',requester=request)
+            self.assertEqual(calls,['/api/tags'])
+            self.assertFalse(document['table transcriptions'])
+            self.assertIn('code listing retained',document['vision ocr']['regions'][0]['reason'])
+
     def test_table_consensus_still_requires_independent_numeric_support(self):
         for verified in (True, False):
             with self.subTest(verified=verified), tempfile.TemporaryDirectory() as directory:

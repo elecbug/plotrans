@@ -228,6 +228,8 @@ Repeated margin artwork is excluded before caption matching, preventing journal 
 
 Captions misclassified as headings or split across blocks are reconnected using fonts, positions, and line spacing. Captions stay intact across chunk boundaries and are attached to figures as complete units. Ordinary captions are normalized to `Fig.`; source image captions containing equations are preserved. Unmatched captions remain in the body.
 
+Printed caption labels also bound source crops. Tables connected across an intervening caption are separated and assigned their own captions before labels and padding expand their crops. Overlapping panels can share one caption, while regions assigned to different captions remain separate. Native table cells also bound equation grouping so adjacent mathematical values stay in their respective rows and columns. Source positions can connect a sentence across columns around a captioned table, while repeated recovered margin headers stay outside the body. Centered code listings with parenthesized line numbers are preserved as complete source regions and excluded from tabular OCR.
+
 When caption coordinates include panel labels such as `(a)` and `(b)`, the caption's top boundary is corrected to the actual `Fig.` text. Correction is deferred if raised mathematical symbols or fonts could be clipped. A table caption is not attached to a preceding figure solely because of proximity.
 
 Outputs use a PDF content hash for figure subdirectories, preventing collisions between papers:

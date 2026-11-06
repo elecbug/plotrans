@@ -366,7 +366,8 @@ def _mark_page_furniture(document: dict) -> None:
         key = side, round(box[1]/height*50), tuple(words[-12:])
         recovered_margins[key].append(node)
     for (side, _, words), candidates in recovered_margins.items():
-        if len(words) < 6 or len({n["page number"] for n in candidates}) < minimum: continue
+        if (len(words) < 3 or len(''.join(words)) < 18
+                or len({n["page number"] for n in candidates}) < minimum): continue
         for node in candidates:
             node["type"] = side
             node["page furniture reason"] = "repeated native text in the same outer margin"
@@ -690,6 +691,8 @@ def order_document(document: dict) -> dict:
     for node in ordered:
         kind = node.get("type")
         if node.get("suppressed") or kind in {"image", "picture", "caption", "frontmatter", "keywords", "footnote", "header", "footer"}:
+            continue
+        if kind == "table" and node.get("caption label"):
             continue
         if kind != "paragraph":
             previous = None

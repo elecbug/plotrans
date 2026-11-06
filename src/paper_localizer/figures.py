@@ -284,13 +284,13 @@ def _text_labels(page) -> list[dict]:
 
 
 def _refine_caption_tops(page, nodes: list[dict]) -> None:
-    """Correct caption bounds that accidentally include subfigure labels above.
+    """Correct caption bounds using the printed figure or table label.
 
-    Find the printed Fig. label using page character coordinates. Keep uncertain
+    Find the printed label using page character coordinates. Keep uncertain
     tall mathematics intact rather than inferring a smaller caption rectangle.
     """
     captions = [n for n in nodes if n.get("type") == "caption"
-                and n.get("caption label", "").startswith("Fig.")]
+                and n.get("caption label", "").startswith(("Fig.", "Table "))]
     if not captions: return
     textpage = page.get_textpage()
     try:
@@ -299,9 +299,11 @@ def _refine_caption_tops(page, nodes: list[dict]) -> None:
         for node in captions:
             left,bottom,right,top = node["bounding box"]
             size = float(node.get("font size") or 9)
-            number = re.escape(node["caption label"][5:]).replace(r"\.", r"\.\s*")
+            is_table = node["caption label"].startswith("Table ")
+            number = re.escape(node["caption label"][6:] if is_table else node["caption label"][5:]).replace(r"\.", r"\.\s*")
+            prefix = r"\bTable\s*" if is_table else r"\bFig(?:ure)?\.?\s*"
             matches = []
-            for match in re.finditer(r"\bFig(?:ure)?\.?\s*"+number+r"(?!\d|\.\d)",text,re.I):
+            for match in re.finditer(prefix+number+r"(?!\d|\.\d)",text,re.I):
                 boxes = [tuple(textpage.get_charbox(i)) for i in range(match.start(),match.end()) if not text[i].isspace()]
                 if not boxes: continue
                 box = boxes[0]
@@ -310,7 +312,10 @@ def _refine_caption_tops(page, nodes: list[dict]) -> None:
                     matches.append(box)
             if not matches: continue
             label = max(matches,key=lambda b:b[3])
-            if top-label[3] < max(4,size*.8): continue
+            # Table labels can sit only a few points below the final border.
+            # A full line-box ascent would clip that border during separation.
+            padding = .7 if is_table else max(1.2, size*.18)
+            if top-label[3] < (padding+.5 if is_table else max(4,size*.8)): continue
             tall_math = False
             for index,code in enumerate(codes):
                 if not code or chr(code).isspace(): continue
@@ -323,7 +328,7 @@ def _refine_caption_tops(page, nodes: list[dict]) -> None:
                         or chr(code) in "=+≤≥∑∫√" or 0x1D400 <= code <= 0x1D7FF):
                     tall_math = True; break
             if not tall_math:
-                node["bounding box"] = [left,bottom,right,label[3]+max(1.2,size*.18)]
+                node["bounding box"] = [left,bottom,right,label[3]+padding]
     finally:
         textpage.close()
 
@@ -341,13 +346,103 @@ def _merge_regions(regions: list[Box]) -> list[Box]:
     return merged
 
 
+def _caption_boundaries(regions: list[Box], captions: list[dict], height: float) -> list[Box]:
+    """Separate artwork joined across a caption, and remove caption slivers.
+
+    The graphics mask omits text, so its dilation can bridge two tables on
+    either side of a caption. Keep the caption outside both source crops.
+    """
+    result = list(regions)
+    for caption in captions:
+        boundary = _node_box(caption, height)
+        if not boundary:
+            continue
+        left, top, right, bottom = boundary
+        margin = .5 if caption.get("caption label", "").startswith("Table ") else 2
+        separated = []
+        for region in result:
+            overlap = min(region[2], right) - max(region[0], left)
+            if (overlap < min(region[2]-region[0], right-left)*.55
+                    or region[3] < top or region[1] > bottom):
+                separated.append(region)
+                continue
+            pieces = []
+            if top - region[1] > 18:
+                pieces.append((region[0], region[1], region[2], top-margin))
+            if region[3] - bottom > 18:
+                pieces.append((region[0], bottom+margin, region[2], region[3]))
+            # An uncertain caption covering an entire small graphic is not
+            # enough evidence to discard that graphic.
+            separated.extend(pieces or [region])
+        result = separated
+    return result
+
+
+def _region_captions(regions: list[Box], captions: list[dict], nodes: list[dict],
+                     height: float, source_tables: list[tuple[Box, str]]) -> list[dict | None]:
+    """Assign adjacent tables jointly before crop expansion changes their gaps."""
+    from .layout import caption_for_region
+    owners: list[dict | None] = [None] * len(regions)
+    used = set()
+    pending = []
+    for index, region in enumerate(regions):
+        label = next((label for box, label in source_tables
+                      if _intersection(region,box)/max(_area(region),1) > .85
+                      and _intersection(region,box)/max(_area(box),1) > .85), None)
+        if label:
+            owners[index] = next((n for n in captions if n.get("caption label") == label), None)
+            if owners[index] is not None:
+                used.add(id(owners[index]))
+            continue
+        choices = []
+        remaining = [n for n in captions if n.get("caption label") not in {label for _, label in source_tables}]
+        while (caption := caption_for_region(region, remaining, height, nodes)) is not None:
+            choices.append(caption)
+            remaining = [n for n in remaining if n is not caption]
+        if not choices:
+            continue
+        if choices[0]["caption label"].startswith("Table "):
+            tables = [n for n in choices if n["caption label"].startswith("Table ")]
+            pending.append((index, tables))
+        else:
+            owners[index] = choices[0]
+    # A table with one eligible caption establishes the boundary for its
+    # neighbor, which can otherwise match both the caption above and below.
+    for index, choices in sorted(pending, key=lambda item: len(item[1])):
+        owners[index] = next((n for n in choices if id(n) not in used), choices[0])
+        used.add(id(owners[index]))
+    return owners
+
+
+def _merge_captioned_regions(regions: list[tuple[Box, dict | None]]) -> list[tuple[Box, dict | None]]:
+    """Keep detached panels with their owner without joining different captions."""
+    grouped = {}
+    for region, caption in regions:
+        if caption is None:
+            continue
+        key = id(caption)
+        grouped[key] = (_union(grouped[key][0], region) if key in grouped else region, caption)
+    unbound = _merge_regions([region for region, caption in regions if caption is None])
+    remaining = []
+    for region in unbound:
+        matches = [key for key, (box, _) in grouped.items() if _intersection(region, box) > 0]
+        if len(matches) == 1:
+            key = matches[0]
+            box, caption = grouped[key]
+            grouped[key] = _union(box, region), caption
+        else:
+            remaining.append((region, None))
+    return list(grouped.values()) + remaining
+
+
 def _pseudocode_region(caption: dict, nodes: list[dict], width: float, height: float) -> Box | None:
     """Text-only algorithm figures have no ink after suppressing text drawing."""
     label = caption.get("content", "")
-    if not re.search(r"\b(?:pseudocode|(?:source )?code|(?:property|function|procedure|algorithm)\s+\d+\s+definition)\b", label, re.I): return None
+    if not re.search(r"\b(?:pseudo\s*code|(?:source )?code|(?:property|function|procedure|algorithm)\s+\d+\s+definition)\b", label, re.I): return None
     cl, cb, cr, ct = caption["bounding box"]
     if cr-cl > width*.55: return None
-    left, right = (0, width/2) if (cl+cr)/2 < width/2 else (width/2, width)
+    centered = cl < width*.42 and cr > width*.58
+    left, right = (0, width) if centered else ((0, width/2) if (cl+cr)/2 < width/2 else (width/2, width))
     above = [n for n in nodes if n is not caption and (b := n.get("bounding box"))
              and left <= (b[0]+b[2])/2 <= right and b[1] > ct
              and n.get("content") and not n.get("suppressed")]
@@ -359,12 +454,13 @@ def _pseudocode_region(caption: dict, nodes: list[dict], width: float, height: f
         box = node["bounding box"];text = node["content"]
         if box[3] > ceiling or node.get("caption label") or node.get("type") in {"header", "footer", "frontmatter"}: break
         if box[1]-top > 45: break
+        if any(re.match(r"^\(\d+\)", n["content"].strip()) for n in group) and not re.match(r"^\(\d+\)", text.strip()): break
         if len(text.split()) > 25 and not re.search(r"//|;|\b(?:for|if|while|return)\b", text): break
         if node.get("type") == "heading" and re.match(r"^(?:\d+(?:\.\d+)*\.?\s+|[IVXLCDM]+\.\s+)[A-Z]", text): break
         group.append(node);top=max(top,box[3])
     control = sum(bool(re.match(r"^(?:for|while|if|else|return|//)\b|^//", n["content"].strip())) for n in group)
     numbered = [int(m[1]) for n in sorted(group,key=lambda n:-n["bounding box"][3])
-                if (m := re.match(r"^(\d+)\s+", n["content"].strip()))]
+                if (m := re.match(r"^\(?(\d+)\)?(?:\s+|$)", n["content"].strip()))]
     numbered_code = (len(numbered)>=4 and numbered==list(range(1,len(numbered)+1))
                      and sum(bool(re.search(r"[(){};=]",n["content"])) for n in group)>=len(group)*.6)
     if len(group) < 4 or control < 2 and not numbered_code: return None
@@ -373,6 +469,8 @@ def _pseudocode_region(caption: dict, nodes: list[dict], width: float, height: f
             node["type"] = "paragraph"
     box = tuple(group[0]["bounding box"])
     for node in group[1:]: box = _union(box, tuple(node["bounding box"]))
+    if centered:
+        left, right = max(0, min(cl, box[0])-2), min(width, max(cr, box[2])+2)
     return left, max(0,height-box[3]-2), right, height-box[1]+2
 
 
@@ -562,7 +660,6 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 labels = nodes + ([] if page_number in document.get("ocr pages", []) else _text_labels(page))
                 # Multi-panel plots share one caption. Group by the caption's
                 # column instead of joining everything that has nearby graphics.
-                from .layout import caption_for_region
                 captions = [n for n in nodes if n.get("type") == "caption"
                             and n.get("content", "").strip() and n.get("caption label")]
                 source_tables = [(_node_box(t,height),t["caption label"])
@@ -570,34 +667,18 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 table_labels = {label for _,label in source_tables} | {
                     n["caption label"] for n in nodes
                     if n.get("source reconstructed table") and n.get("caption label")}
-                unclaimed_captions = [n for n in captions if n["caption label"] not in table_labels]
-                def owned_caption(region):
-                    table = next((label for box,label in source_tables
-                                  if _intersection(region,box)/max(_area(region),1)>.85
-                                  and _intersection(region,box)/max(_area(box),1)>.85),None)
-                    if table:
-                        return next((n for n in captions if n.get("caption label")==table),None)
-                    return caption_for_region(region,unclaimed_captions,height,nodes)
                 regions = _include_graphic_fragments(regions, fragments, captions, nodes, height)
+                regions = _caption_boundaries(regions, captions, height)
+                available = [n for n in captions if n["caption label"] not in table_labels
+                             or n["caption label"] in {label for _, label in source_tables}]
+                owners = _region_captions(regions, available, nodes, height, source_tables)
                 expanded = []
-                for region in regions:
+                for region, caption in zip(regions, owners):
                     if any(_intersection(region,box)/max(_area(region),1)>.98
                            and _intersection(region,box)/max(_area(box),1)>.98 for box,_ in source_tables):
-                        expanded.append(region)
+                        expanded.append((region, caption))
                         continue
-                    # A colored caption bullet can touch the figure's frame in
-                    # the graphics mask. The caption must remain wholly outside
-                    # the crop instead of leaving its first line inside it.
-                    for boundary in captions:
-                        if not boundary.get("caption label", "").startswith("Fig."): continue
-                        cl, cb, cr, ct = boundary["bounding box"]
-                        caption_top = height-ct
-                        overlap = min(region[2], cr)-max(region[0], cl)
-                        if (overlap > min(region[2]-region[0], cr-cl)*.55
-                                and region[1]+18 < caption_top <= region[3]
-                                and region[3]-caption_top <= ct-cb+12):
-                            region = region[0],region[1],region[2],caption_top-2
-                    caption = owned_caption(region)
+                    original_region = region
                     if caption:
                         left, _, right, _ = caption["bounding box"]
                         # A centered caption may be shorter than its figure.
@@ -623,20 +704,28 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                         region = _include_labels(region, local_labels, width, height)
                     else:
                         region = _include_labels(region, [] if _portrait_label(region, nodes, height) else labels, width, height)
-                    expanded.append(region)
-                regions = _merge_regions(expanded)
-                grouped: dict[str, tuple[Box, dict | None]] = {}
-                for part_index, region in enumerate(regions):
-                    caption = owned_caption(region)
-                    key = str(id(caption)) if caption else f"unbound-{part_index}"
-                    if key in grouped:
-                        region = _union(grouped[key][0], region)
-                    grouped[key] = region, caption
-                region_captions = sorted(grouped.values(), key=lambda item: (item[0][1], item[0][0]))
+                    # Padding or a detached text label must not bridge back
+                    # across the caption that separated the original artwork.
+                    region = max(_caption_boundaries([region], captions, height),
+                                 key=lambda box: _intersection(box, original_region))
+                    expanded.append((region, caption))
+                # Text labels can bring an initially distant fragment within
+                # caption range. Keep established owners and resolve only the
+                # remaining parts, then reconnect overlapping unowned panels.
+                claimed = {id(caption) for _, caption in expanded if caption is not None
+                           and caption["caption label"].startswith("Table ")}
+                from .layout import caption_for_region
+                expanded = [(region, caption if caption is not None else caption_for_region(
+                    region, [n for n in available if id(n) not in claimed], height, nodes))
+                    for region, caption in expanded]
+                region_captions = sorted(_merge_captioned_regions(expanded),
+                                         key=lambda item: (item[0][1], item[0][0]))
+                listing_captions = set()
                 for caption in captions:
                     if any(owner is caption for _,owner in region_captions): continue
                     if region := _pseudocode_region(caption, nodes, width, height):
                         region_captions.append((region,caption))
+                        listing_captions.add(id(caption))
                 region_captions.sort(key=lambda item: (item[0][1], item[0][0]))
                 for figure_index, (region, caption) in enumerate(region_captions, 1):
                     asset_dir.mkdir(parents=True, exist_ok=True)
@@ -658,6 +747,7 @@ def attach_figures(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                         "alt": caption["caption label"] if caption else portrait or f"Image p.{page_number}-{figure_index}",
                         "asset kind": "table" if caption and caption["caption label"].startswith("Table ") else "portrait" if portrait else "figure",
                         **({"caption label": caption["caption label"]} if caption else {}),
+                        **({"source listing": True} if caption is not None and id(caption) in listing_captions else {}),
                     })
             finally:
                 page.close(); graphics_page.close()

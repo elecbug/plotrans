@@ -207,7 +207,7 @@ def _expand_expressions(spans: list[TextSpan]) -> list[TextSpan]:
     return [replace(span, math=True) if index in selected else span for index, span in enumerate(spans)]
 
 
-def _groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
+def _groups(spans: list[TextSpan], owners: dict[int, Box] | None = None) -> list[list[TextSpan]]:
     groups: list[list[TextSpan]] = []
     previous_math = False
     for span in spans:
@@ -218,7 +218,8 @@ def _groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
             previous = groups[-1][-1]
             gap_x = max(span.box[0] - previous.box[2], previous.box[0] - span.box[2], 0)
             gap_y = max(span.box[1] - previous.box[3], previous.box[1] - span.box[3], 0)
-            if gap_x <= 30 and gap_y <= max(8, min(max(span.font_size, previous.font_size), 18) * 1.4):
+            same_cell = owners is None or owners.get(span.index) == owners.get(previous.index)
+            if same_cell and gap_x <= 30 and gap_y <= max(8, min(max(span.font_size, previous.font_size), 18) * 1.4):
                 groups[-1].append(span)
             else:
                 groups.append([span])
@@ -233,7 +234,8 @@ def _groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
         box = _group_box(group)
         while True:
             touching = next((i for i, other in enumerate(merged)
-                             if _intersection(box, _group_box(other)) >
+                             if (owners is None or owners.get(group[0].index) == owners.get(other[0].index))
+                             and _intersection(box, _group_box(other)) >
                              min(_area(box), _area(_group_box(other))) * .08), None)
             if touching is None:
                 break
@@ -247,6 +249,7 @@ def _groups(spans: list[TextSpan]) -> list[list[TextSpan]]:
         box = _group_box(group)
         baseline = group[-1].baseline
         punctuation = [span for span in spans if span.index not in owned and span.text in {".", ",", ";", ":"}
+                       and (owners is None or owners.get(span.index) == owners.get(group[0].index))
                        and -.5 <= span.box[0]-box[2] <= .4 and abs(span.baseline-baseline) < 1]
         if punctuation:
             span = min(punctuation, key=lambda item: item.box[0])
@@ -259,6 +262,17 @@ def _group_box(group: list[TextSpan]) -> Box:
     for span in group[1:]:
         box = _union(box, span.box)
     return box
+
+
+def _cell_owners(spans: list[TextSpan], cells: list[Box]) -> dict[int, Box]:
+    """Physical cells bound math groups, even when their glyphs are adjacent."""
+    return {span.index: min(matches, key=_area) for span in spans
+            if (matches := [cell for cell in cells if _inside(span.box, cell, padding=0)])}
+
+
+def _within_cell(region: Box, cell: Box, padding: float = 2.5) -> bool:
+    return (cell[0]-padding <= region[0] and cell[1]-padding <= region[1]
+            and region[2] <= cell[2]+padding and region[3] <= cell[3]+padding)
 
 
 def _plain_text_group(group: list[TextSpan], node: dict) -> bool:
@@ -392,9 +406,12 @@ def _remove_figure_duplicates(nodes: list[dict], spans: list[TextSpan], figure_b
         if preserve_captions and (node.get("type") == "caption"
                                   or re.match(r"^(?:-\s*)?(?:Fig(?:ure)?\.?|Table)\s*(?:\d|[IVXLCDM]+\b)", content, re.I)): continue
         selected = [span for span in spans if _inside(span.box, box)]
+        cell_box = tuple(node.get('native table cell box', box))
+        owned_boxes = [figure for figure in figure_boxes if figure and
+                       (not node.get('native table cell') or _within_cell(figure, cell_box))]
         marked = [replace(span, math=any(
             figure and _intersection(span.box, figure) / max(_area(span.box), 1) >= 0.7
-            for figure in figure_boxes)) for span in selected]
+            for figure in owned_boxes)) for span in selected]
         covered = [span for span in marked if span.math]
         if not covered: continue
         if len(covered) == len(marked):
@@ -447,6 +464,8 @@ def _reconcile_snapshots(nodes: list[dict], spans: list[TextSpan], assets: list[
             if node is owner or id(node) in suppressed or not (box := _box(node)):
                 continue
             if not node.get("content") and not node.get("formula snapshot"):
+                continue
+            if node.get('native table cell') and not _within_cell(region, tuple(node.get('native table cell box', box))):
                 continue
             if node.get("formula snapshot") or node.get("formula image"):
                 markup = node.get("formula snapshot") or node.get("content", "")
@@ -702,6 +721,15 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
     asset_dir = output_dir / "figs" / digest
     by_page: dict[int, list[dict]] = defaultdict(list)
     table_boxes: dict[int, list[Box]] = defaultdict(list)
+    cell_boxes: dict[int, list[Box]] = defaultdict(list)
+    for cell in list(_nodes(document)):
+        if cell.get('type') != 'table cell' or not (box := _box(cell)):
+            continue
+        cell_boxes[cell.get('page number', 1)].append(box)
+        for child in _nodes(cell):
+            if isinstance(child.get('content'), str):
+                child['native table cell'] = True
+                child['native table cell box'] = list(box)
     for node in _nodes(document):
         if node.get('type')=='table' and _box(node):
             table_boxes[node.get('page number',1)].append(_box(node))
@@ -723,6 +751,7 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 from .source_text import normalized_spans
                 spans = filter_counters(_spans(page),document,page_number)
                 spans = normalized_spans(spans,document,page_number)
+                owners = _cell_owners(spans, cell_boxes[page_number])
                 undecoded = sum(not s.font_name for s in spans)
                 if spans and undecoded / len(spans) > .75:
                     # Some old PDFs encode *all prose* as custom Type3 glyphs.
@@ -761,12 +790,12 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                 unassigned: list[TextSpan] = []
                 nodes = [node for node in nodes if node.get("content", "").strip() and not node.get('suppressed')]
                 plain_ids = set()
-                for group in _groups(spans):
+                for group in _groups(spans, owners):
                     if any(_inside(_group_box(group), _box(node), padding=.5)
                            and _plain_text_group(group, node) for node in nodes):
                         plain_ids.update(span.index for span in group)
                 spans = [replace(span, math=False) if span.index in plain_ids else span for span in spans]
-                for group in _groups(spans):
+                for group in _groups(spans, owners):
                     group_box = _group_box(group)
                     candidates = []
                     for index, node in enumerate(nodes):
@@ -781,7 +810,7 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     else:
                         unassigned.extend(group)
                 unassigned_ids = {span.index for span in unassigned}
-                orphan_groups = _groups([s for s in spans if not s.math or s.index in unassigned_ids])
+                orphan_groups = _groups([s for s in spans if not s.math or s.index in unassigned_ids], owners)
                 document["deduplicated equation text"] = document.get("deduplicated equation text", 0) + _remove_figure_duplicates(
                     nodes, spans, [_group_box(group) for group in orphan_groups], preserve_captions=False)
                 counter = 0
@@ -828,12 +857,12 @@ def recover_formulas(pdf_path: Path, document: dict, output_dir: Path) -> dict:
                     node_box = _box(node)
                     assigned_ids = {s.index for s in assigned}
                     if not node.get("content", "").strip():
-                        orphan_groups.extend(_groups([s for s in spans if not s.math or s.index in assigned_ids]))
+                        orphan_groups.extend(_groups([s for s in spans if not s.math or s.index in assigned_ids], owners))
                         continue
                     selected = [s for s in spans if _inside(s.box, node_box) or s.index in assigned_ids]
                     # Keep normal anchors and only the formulas owned by this node.
                     selected = [s for s in selected if not s.math or s.index in assigned_ids]
-                    groups = _groups(selected)
+                    groups = _groups(selected, owners)
                     ranges = _insertions(node["content"], selected, groups)
                     if ranges is None:
                         # Preserve uncertain alignment as a complete source snapshot

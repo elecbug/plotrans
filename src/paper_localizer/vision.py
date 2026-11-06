@@ -488,6 +488,10 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
                 for asset in document.get("figures", []):
                     if asset["page number"] != page_number or asset.get("asset kind") != "table": continue
                     detail = {"page": page_number, "kind": "table", "source": asset["source"], "accepted": False}
+                    if asset.get("source listing"):
+                        detail["reason"] = "Source code listing retained; tabular OCR does not apply."
+                        details.append(detail)
+                        continue
                     if asset['source'] in table_text:
                         detail.update(accepted=True, reason='native table cells independently verified; model OCR unnecessary',
                                       verification=table_text[asset['source']]['verification'])
