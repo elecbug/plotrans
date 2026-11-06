@@ -316,8 +316,11 @@ def _links_html(links: list[dict]) -> str:
 
 def _table_transcription(unit: Unit) -> str:
     if not unit.table_data: return ""
+    native = unit.table_data.get('verification', {}).get('method') == 'native-geometry'
+    explanation = ('Native table cells checked against positioned source text with independent PDF engines. '
+                   if native else 'OCR transcription checked across rendering resolutions and against independent OCR. ')
     return ('<details class="table-transcription"><summary>Searchable table transcription</summary>'
-            '<p>OCR transcription checked across rendering resolutions and against independent OCR. '
+            '<p>' + explanation +
             'The original image remains the reference for values and notation.</p>'
             + table_html(unit.table_data["rows"], lambda value: _md_html(value, inline=True)) + '</details>')
 
@@ -489,8 +492,10 @@ def write_article(document: dict, title: str, filename: str, chunks, translation
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         temporary.write_text(text, encoding="utf-8"); temporary.replace(destination)
     ocr_report = output.with_suffix(".ocr.json")
-    if vision := document.get("vision ocr"):
+    vision = document.get('vision ocr', {})
+    if vision or document.get('native table transcriptions'):
         ocr_report.write_text(json.dumps({"vision": vision, "equations": document.get("math transcriptions", {}),
+                                         "native_tables": document.get('native table transcriptions', []),
                                          "tables": document.get("table transcriptions", {})},
                                         ensure_ascii=False, indent=2), encoding="utf-8")
     else:

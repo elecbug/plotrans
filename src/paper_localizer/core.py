@@ -340,6 +340,8 @@ def prepare_document(pdf_path: Path, document: dict, output_dir: Path, *, ocr: O
     document = preserve_ocr_regions(pdf_path, document, output_dir)
     document = attach_figures(pdf_path, document, output_dir)
     document = recover_formulas(pdf_path, document, output_dir)
+    from .table_evidence import supplement_source_tables
+    document = supplement_source_tables(pdf_path, document)
     if ocr and ocr.vision_model:
         from .vision import refine_document
         document = refine_document(pdf_path, document, output_dir,

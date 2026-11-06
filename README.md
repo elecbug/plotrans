@@ -7,6 +7,8 @@ Turn PDF papers into structured Markdown and HTML with OpenDataLoader PDF. Extra
 - PDF extraction: `opendataloader-pdf==2.5.17` (local Java process)
 - OCR: `rapidocr==3.10.0`, `onnxruntime==1.23.2` (local CPU), `opencv-python-headless==4.12.0.88`, `numpy==2.2.6`
 - Figure extraction and rendering: `pypdf==6.10.0`, `pypdfium2==5.14.0`, `Pillow==12.3.0`
+- Native table proposals: `pdfplumber==0.11.10`, checked against positioned PDFium text
+- Source prose alignment: `rapidfuzz==3.14.6` (longest common subsequence)
 - Translation: `kaelri/hy-mt2:7b-q4_K_M`, Tencent's official `Hy-MT2-7B` GGUF weights with an Ollama template
 - Summaries: `qwen3:4b`
 - Web UI: `streamlit==1.66.1`
@@ -202,6 +204,8 @@ Text-only code and property definitions can also retain complete source figures 
 
 Simple ruled tables missed by the layout extractor are recovered from native horizontal rules and glyph positions. Editable cells require clear column boundaries and an exact character inventory; uncertain tables retain a complete source crop. Printed captions are assigned once so adjacent tables cannot share a caption. Basic decoded ratios and percentages in recovered cells remain searchable. UTF-16 surrogate pairs are combined before glyph alignment, and complete source-character agreement takes precedence over approximate text anchors when replacing repeated mathematical variables.
 
+Some ruled-table images can also include a collapsible **Searchable table transcription** without a document OCR model. [pdfplumber](https://github.com/jsvine/pdfplumber/blob/v0.11.10/README.md#extracting-tables) proposes the row and column boundaries; PDFium independently checks the complete text in every cell. Every positioned source span must belong to exactly one cell. Simple subscripts and superscripts use native glyph geometry. Split words, uncertain merged cells, undecodable text, and ambiguous notation retain the source image without a native transcription. This supplements the original image, and checked native tables skip model-based table recognition when document OCR is enabled. Verification details, engine versions, and rejected proposals are saved in `.ocr.json` and included in the ZIP even when model OCR is disabled.
+
 Captions also separate aligned groups of table rules, preventing a page separator from joining a table below it. Isolated display equations split into nearby fragments can retain one complete source crop, including fractions and summation limits. Palatino `Ital` font names are recognized for inline variables and subscripts; native matches around each mathematical group keep ordinary prose editable when source labels or positioned accents differ slightly.
 
 Indented variable definitions retain complete source blocks so their labels, explanatory words, and original line layout stay together. Optional OCR of these definitions uses the native prose-preservation checks. Source tables are excluded from display-equation merging, and monospaced code line numbers and sequences that restart are excluded from review-counter removal.
@@ -258,6 +262,8 @@ When inline math prevents whole-paragraph spacing restoration, long matching pro
 Missing spaces at a prose font change can also be restored when native glyph positions show a word-sized gap, both sides are English words, and their concatenation is not a known word. This repairs `itslocal` → `its local` without splitting known words, mathematical expressions, code, or URLs. Ambiguous repeated occurrences retain their existing text.
 
 Small omissions inside otherwise matching prose can be restored between native text anchors. The paragraph must have at least 90% agreement; existing letters within each repaired gap remain a source subsequence. The recovery adds native prose letters, punctuation, and spacing. This catches missing words even when the same words occur later in the paragraph. Mathematical or undecodable additions, code, numeric changes, links, and text outside the matching anchors are excluded. Audit JSON records these additions under `source prose insertions`.
+
+This recovery uses [RapidFuzz's longest common subsequence alignment](https://rapidfuzz.github.io/RapidFuzz/Usage/distance/LCSseq.html) to match repeated source text. It still requires exact local anchors and native font ownership; similarity alone cannot approve an insertion. Each insertion records the alignment profile and both bounded and complete-source agreement.
 
 When layout bounds overlap neighboring rows, agreement is checked between matching paragraph anchors and the complete-box agreement is recorded separately. Local native font ownership keeps nearby mathematics out of prose additions. Short words, known source-word spellings, source punctuation, and explicit initials in numbered, dated references have separate checks. Prose snapshots also complete a partly covered ordinary word before its duplicate text is removed, with a bounded expansion.
 

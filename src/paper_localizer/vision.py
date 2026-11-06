@@ -291,7 +291,12 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
     digest = source_sha256[:12]
     cache_dir = output_dir / ".vision-cache" / digest
     cache_dir.mkdir(parents=True, exist_ok=True)
-    details, math_text, sources, table_text = [], {}, [], {}
+    table_text = {source: data for source, data in document.get('table transcriptions', {}).items()
+                  if data.get('verification', {}).get('method') == 'native-geometry'
+                  and data['verification'].get('accepted')
+                  and data['verification'].get('complete_span_ownership')
+                  and data['verification'].get('profile') == 'native-table-cells-v1'}
+    details, math_text, sources = [], {}, []
     backend_unavailable = False
 
     def recognize(page, box, mode, scale):
@@ -483,6 +488,11 @@ def refine_document(pdf_path: Path, document: dict, output_dir: Path, *, model: 
                 for asset in document.get("figures", []):
                     if asset["page number"] != page_number or asset.get("asset kind") != "table": continue
                     detail = {"page": page_number, "kind": "table", "source": asset["source"], "accepted": False}
+                    if asset['source'] in table_text:
+                        detail.update(accepted=True, reason='native table cells independently verified; model OCR unnecessary',
+                                      verification=table_text[asset['source']]['verification'])
+                        details.append(detail)
+                        continue
                     try:
                         candidates, failures, first = [], [], None
                         for scale in (3, 4.5, 6):

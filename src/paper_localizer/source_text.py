@@ -11,6 +11,7 @@ import re
 import unicodedata
 
 import pypdfium2 as pdfium
+from rapidfuzz.distance import LCSseq
 
 from .figures import _union
 from .formulas import _MATH_FONT, _inside, _canonical, TextSpan
@@ -310,6 +311,13 @@ def restore_local_spacing(node, textpage, page_number, document):
     return True
 
 
+def _source_alignment(source, target):
+    """Align repeated source prose without greedy longest-block selection."""
+    matches = LCSseq.opcodes(source, target).as_matching_blocks()
+    agreement = 2 * sum(match.size for match in matches) / max(len(source) + len(target), 1)
+    return matches, agreement
+
+
 def restore_prose_omissions(node, textpage, spans, page_number, document):
     """Restore small native prose omissions between matching text anchors.
 
@@ -333,10 +341,10 @@ def restore_prose_omissions(node, textpage, spans, page_number, document):
     target,target_offsets = _canonical(text)
     if source==target or min(len(source),len(target))<48:
         return False
-    matcher = SequenceMatcher(None,source,target,autojunk=False)
-    matches = [m for m in matcher.get_matching_blocks() if m.size]
+    matches, complete_agreement = _source_alignment(source, target)
+    matches = [m for m in matches if m.size]
     strong = [m for m in matches if m.size>=8]
-    agreement = matcher.ratio()
+    agreement = complete_agreement
     if strong:
         first,last = strong[0],strong[-1]
         matched = sum(m.size for m in matches if first.a<=m.a<=last.a and first.b<=m.b<=last.b)
@@ -358,9 +366,9 @@ def restore_prose_omissions(node, textpage, spans, page_number, document):
     aligned = ''.join(projected)==source
     projection_matches = []
     if not aligned:
-        projection = SequenceMatcher(None,''.join(projected),source,autojunk=False)
-        if projection.ratio()>=.9:
-            projection_matches = [m for m in projection.get_matching_blocks() if m.size>=24]
+        projection, projection_agreement = _source_alignment(''.join(projected), source)
+        if projection_agreement>=.9:
+            projection_matches = [m for m in projection if m.size>=24]
     def ordinary(span):
         # A list bullet contributes no letters and cannot be part of a prose
         # addition. Its Symbol/Math font must not veto the ordinary list text.
@@ -370,7 +378,7 @@ def restore_prose_omissions(node, textpage, spans, page_number, document):
     wholly_ordinary = all(ordinary(span) for span in selected)
     if not aligned and not projection_matches and not wholly_ordinary:
         return False
-    anchors = [m for m in matcher.get_matching_blocks() if m.size>=8]
+    anchors = [m for m in matches if m.size>=8]
     protected = [m.span() for m in _LINK.finditer(text)]
     edits = []
     for left,right in zip(anchors,anchors[1:]):
@@ -385,8 +393,7 @@ def restore_prose_omissions(node, textpage, spans, page_number, document):
         if (not 1<=len(addition)<=80 or not any(char.isalpha() for char in addition)
                 or not reference_initial and any(not char.isalpha() and char not in "-‐'’,;:" for char in addition)):
             continue
-        preserved = SequenceMatcher(None,addition,target[c:d],autojunk=False)
-        if len(addition)<=d-c or any(kind in {'insert','replace'} for kind,*_ in preserved.get_opcodes()):
+        if len(addition)<=d-c or LCSseq.similarity(addition,target[c:d])!=d-c:
             continue
         start,end = target_offsets[c-1]+1,target_offsets[d]
         if any(x<end and start<y for x,y in protected):
@@ -420,7 +427,8 @@ def restore_prose_omissions(node, textpage, spans, page_number, document):
         text = text[:start]+replacement+text[end:]
         document.setdefault('source prose insertions',[]).append({
             'page':page_number,'box':list(box),'original':original,'restored':replacement,
-            'source agreement':round(agreement,6),'complete native box agreement':round(matcher.ratio(),6),
+            'source agreement':round(agreement,6),'complete native box agreement':round(complete_agreement,6),
+            'alignment':'rapidfuzz-lcs-v1',
         })
     node['content'] = text
     return True
