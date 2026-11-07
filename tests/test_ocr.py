@@ -64,7 +64,7 @@ class OcrTests(unittest.TestCase):
             self.assertNotIn("source image pages",document)
             self.assertEqual(len([b for b in blocks if b.kind=="formula"]),2)
             self.assertFalse(any((f["bounding box"][2]-f["bounding box"][0])>550 for f in document["figures"]))
-            output=write_article(document,"OCR test",source.name,make_chunks(blocks),None,"","English",root/"paper.md")
+            output=write_article(document,"OCR test",source.name,make_chunks(blocks),None,"English",root/"paper.md")
             for path in [output,output.with_suffix(".html")]:
                 body=path.read_text(encoding="utf-8")
                 self.assertIn("Original pages used for OCR",body)

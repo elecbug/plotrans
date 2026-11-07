@@ -96,7 +96,7 @@ class LayoutTests(unittest.TestCase):
             figures = [u for u in article.front if u.kind == "figure"]
             self.assertEqual(len(figures), 2)
             self.assertIn("the full caption ending.", figures[0].caption.source)
-            output = write_article(document, "Two columns", source.name, chunks, None, "", "English", root/"paper.md")
+            output = write_article(document, "Two columns", source.name, chunks, None, "English", root/"paper.md")
             for path in [output, output.with_suffix(".html")]:
                 text = path.read_text(encoding="utf-8")
                 self.assertEqual(text.count("the full caption ending."), 1)

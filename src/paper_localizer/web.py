@@ -7,7 +7,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from paper_localizer.core import (OLLAMA_URL, SUMMARY_MODEL, TRANSLATION_MODEL,
+from paper_localizer.core import (OLLAMA_URL, TRANSLATION_MODEL,
                                   OllamaClient, ProcessingError, extract_pdf, process_pdf)
 from paper_localizer.bundle import standalone_html
 from paper_localizer.ocr import OcrOptions
@@ -17,13 +17,13 @@ from paper_localizer.vision import DEFAULT_VISION_MODEL
 def main() -> None:
     st.set_page_config(page_title="PLoTrans", page_icon="📄", layout="wide")
     st.title("PLoTrans")
-    st.caption("Turn PDF papers into HTML and Markdown, with optional translation and summaries.")
-    mode = st.radio("Processing mode", ["Extract only", "Translate and summarize"], horizontal=True)
-    translate = mode == "Translate and summarize"
+    st.caption("Parse PDF papers into HTML and Markdown, with optional translation.")
+    mode = st.radio("Processing mode", ["Parse only", "Parse and translate"], horizontal=True)
+    translate = mode == "Parse and translate"
     if translate:
-        st.info("Extract the original paper, then add a translation and summary. Requires Ollama and both models.")
+        st.info("Parse the original paper, then translate it. Requires Ollama and the translation model.")
     else:
-        st.info("Generate original HTML, Markdown, and ZIP without translation or summaries. Default settings work without Ollama.")
+        st.info("Generate original HTML, Markdown, and ZIP. Default parsing settings work without Ollama.")
     uploaded = st.file_uploader("Choose a paper PDF", type="pdf")
     vision_choice = st.selectbox(
         "High quality document OCR", ["Disabled", DEFAULT_VISION_MODEL, "Custom model"],
@@ -38,7 +38,6 @@ def main() -> None:
     with st.expander("Settings", expanded=False, key="processing_settings"):
         if translate:
             translation_model = st.text_input("Translation model", TRANSLATION_MODEL)
-            summary_model = st.text_input("Summary model", SUMMARY_MODEL)
             target_language = st.text_input("Target language", "English")
         chunk_size = st.slider("Chunk size (characters)", 500, 3500, 1800, 100)
         ocr_mode = st.selectbox("OCR mode", ["auto", "off", "force"],
@@ -47,7 +46,7 @@ def main() -> None:
         ollama_url = OLLAMA_URL
         if translate or vision_choice != "Disabled":
             ollama_url = st.text_input("Ollama URL", OLLAMA_URL)
-    action = "Translate and summarize" if translate else "Extract and generate HTML"
+    action = "Parse and translate" if translate else "Parse and generate HTML"
     if st.button(action, disabled=uploaded is None, type="primary") and uploaded:
         if vision_choice == "Custom model" and not vision_model:
             st.warning("Enter a model name for document OCR.")
@@ -77,7 +76,7 @@ def main() -> None:
                 if translate:
                     result = process_pdf(
                         source, destination, translation_model=translation_model,
-                        summary_model=summary_model, target_language=target_language,
+                        target_language=target_language,
                         chunk_size=chunk_size, ollama_url=ollama_url, progress=update, ocr=ocr,
                     )
                 else:

@@ -6,7 +6,7 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw, ImageFont
 
 from paper_localizer.article import _md_html
-from paper_localizer.core import _summary_prompt, _translate_chunk, extract_blocks, make_chunks
+from paper_localizer.core import _translate_chunk, extract_blocks, make_chunks
 from paper_localizer.math_markup import mathml, valid_math
 from paper_localizer.ocr import _math_line
 from paper_localizer.vision import (_math_key, _prose_agrees, _prose_consistent,
@@ -227,12 +227,8 @@ class VisionTests(unittest.TestCase):
         self.assertFalse(valid_math('$2^{i$'))
         self.assertFalse(valid_math('incomplete $2^i'))
 
-    def test_models_receive_equation_meaning_without_asset_paths(self):
+    def test_generic_translation_receives_equation_meaning_without_asset_paths(self):
         image = '![Equation](figs/paper/equation.png)'
-        prompt = _summary_prompt('Bound: '+image, (4,), 'English', {'figs/paper/equation.png':'2^{i}'})
-        self.assertIn('2^{i}', prompt)
-        self.assertNotIn('figs/', prompt)
-        self.assertIn('unresolved equation', _summary_prompt(image,(4,),'English'))
         class Client:
             def chat(self, model, prompt, **kwargs):
                 self.prompt = prompt

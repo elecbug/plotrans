@@ -145,7 +145,7 @@ class NativeTableEvidenceTests(unittest.TestCase):
     def test_native_evidence_is_saved_without_a_vision_model(self):
         document = supplement_source_tables(self.path, self.document)
         output = self.root/'paper.md'
-        write_article(document, 'Native table', 'source.pdf', [], None, '', 'English', output)
+        write_article(document, 'Native table', 'source.pdf', [], None, 'English', output)
         evidence = json.loads(output.with_suffix('.ocr.json').read_text())
         self.assertFalse(evidence['vision'])
         self.assertEqual(evidence['tables'][self.asset['source']]['verification']['cell_count'], 6)

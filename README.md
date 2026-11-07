@@ -1,6 +1,6 @@
 # PLoTrans
 
-Turn PDF papers into structured Markdown and HTML with OpenDataLoader PDF. Extract the original document on its own, or add translation with Tencent HY-MT2-7B and a summary from a separate local model. Documents include a title, abstract, table of contents, sections, figures, captions, and references. PDF content is sent only to local processors and Ollama.
+Turn PDF papers into structured Markdown and HTML with OpenDataLoader PDF. Parse the original document on its own, or add translation with Tencent HY-MT2-7B. Documents include a title, abstract, table of contents, sections, figures, captions, and references. PDF content is sent only to local processors and Ollama.
 
 ## Components
 
@@ -10,7 +10,6 @@ Turn PDF papers into structured Markdown and HTML with OpenDataLoader PDF. Extra
 - Native table proposals: `pdfplumber==0.11.10`, checked against positioned PDFium text
 - Source prose alignment: `rapidfuzz==3.14.6` (longest common subsequence)
 - Translation: `kaelri/hy-mt2:7b-q4_K_M`, Tencent's official `Hy-MT2-7B` GGUF weights with an Ollama template
-- Summaries: `qwen3:4b`
 - Web UI: `streamlit==1.66.1`
 - Document rendering: `markdown-it-py==4.0.0`, `mdurl==0.1.2`
 - Equation rendering: `latex2mathml==3.78.1` (MathML without external JavaScript)
@@ -21,6 +20,16 @@ Turn PDF papers into structured Markdown and HTML with OpenDataLoader PDF. Extra
 
 The default translation model tag is listed on the [HY-MT2 Ollama distribution page](https://ollama.com/kaelri/hy-mt2). Tencent's [official model page](https://huggingface.co/tencent/Hy-MT2-7B) provides the translation prompt and recommended inference settings. To use another installed tag, set `--translation-model` in the CLI or change the web UI settings.
 
+For dense HY-MT2 tags, the client verifies the installed tokenizer's native tokens and sends a raw native prompt through Ollama's generation API. This bypasses older MT1.x templates packaged with some MT2 tags. Other model architectures keep their chat templates. Requests use an 8192-token context. HY-MT2 receives only the protected source excerpt and translation instructions; free-form paper context and equation glossaries are omitted because they can leak into translated text.
+
+The application has two processing modes: parsing and parsing with translation. It does not generate summaries or require a separate language model. Checkpoints include the translation model digest and inference profile so incompatible results are not reused.
+
+Native tables are translated cell by cell while retaining their source rows, columns and merged cells. Numeric expressions and single-word column identifiers stay unchanged. Titles and section headings retain their translations in HTML, Markdown and the table of contents. Figure labels, table images and searchable OCR transcriptions retain their source language.
+
+Reference sections retain their original text to preserve page ranges, years, titles and identifiers such as DOIs. They are excluded from model requests and remain visible in every reading view. A following appendix or notes section is translated normally.
+
+Translation checks reject incomplete generations, damaged Unicode, omitted numeric literals, altered numeric citation identifiers, and missing or duplicated equation placeholders. Thousands separators are normalized, and words may become digits. If an excerpt or table cell still fails these checks, its source text remains visible and the document displays a note. A `.translation.json` report records affected locations and model identities and is included in the ZIP. Numeric checks compare digit strings. Negation, technical terminology, units, sign interpretation and other semantic errors still require comparison with the original.
+
 ## Option 1: Docker Compose (Windows, macOS, Linux)
 
 Requires Docker Desktop or Docker Engine with Compose and the project's `docker-compose.yaml`. The first run downloads images and models and requires internet access. Processing does not require external API keys.
@@ -28,11 +37,10 @@ Requires Docker Desktop or Docker Engine with Compose and the project's `docker-
 ```sh
 docker compose up -d ollama
 docker compose exec ollama ollama pull kaelri/hy-mt2:7b-q4_K_M
-docker compose exec ollama ollama pull qwen3:4b
 docker compose up --build -d app
 ```
 
-Open <http://127.0.0.1:8501> and choose a **Processing mode**. The default, **Extract only**, generates the original document without translation or summaries: upload a PDF and click **Extract and generate HTML**. To include a translation and summary, select **Translate and summarize** and click the matching button.
+Open <http://127.0.0.1:8501> and choose a **Processing mode**. The default, **Parse only**, generates the original document: upload a PDF and click **Parse and generate HTML**. To include a translation, select **Parse and translate** and click the matching button.
 
 Download the result with **Download paper ZIP**, or find the files in `outputs/`. The ZIP includes Markdown, HTML, shared CSS, and every referenced image. Stop the services with `docker compose down`; models remain in the Docker volume.
 
@@ -71,15 +79,14 @@ python -m pip install --upgrade pip
 python -m pip install -e '.[ui,ocr]'
 ```
 
-3. For translation and summaries, install [Ollama](https://ollama.com/download), start it, and download both models. Skip this step for extraction with the default settings.
+3. For translation, install [Ollama](https://ollama.com/download), start it, and download the translation model. Skip this step for parsing with the default settings.
 
 ```sh
 ollama pull kaelri/hy-mt2:7b-q4_K_M
-ollama pull qwen3:4b
 paper-localizer doctor
 ```
 
-If Ollama is not running, start `ollama serve` in a separate terminal. `doctor` checks Python packages, Java, the Ollama connection, and both models. For extraction dependencies alone, use `paper-localizer doctor --skip-ollama`.
+If Ollama is not running, start `ollama serve` in a separate terminal. `doctor` checks Python packages, Java, the Ollama connection, and the translation model. For parsing dependencies alone, use `paper-localizer doctor --skip-ollama`.
 
 4. Start the web UI or use the CLI.
 
@@ -91,9 +98,9 @@ paper-localizer run "path/to/paper.pdf" -o "outputs/paper.translated.md"
 
 The web UI opens at <http://localhost:8501>. Run `paper-localizer extract --help` or `paper-localizer run --help` for CLI options. Use `--target-language` to change the translation language and `--chunk-size` to adjust the number of characters per model request.
 
-`extract` generates the original document without translation or summaries. Specify a `.md` path with `-o`; matching `.html` and `.zip` files are created alongside it. Ollama is unnecessary unless you enable the optional document OCR model.
+`extract` parses the original document without translation. Specify a `.md` path with `-o`; matching `.html` and `.zip` files are created alongside it. Ollama is unnecessary unless you enable the optional document OCR model.
 
-The web UI's **Extract only** mode follows the same extraction path, hides translation and summary settings, and writes `<paper>.extracted.md`, `.html`, and `.zip`. **Translate and summarize** writes `<paper>.translated.*`. Both modes provide downloads and an HTML preview. The latest result shows which mode produced it.
+The web UI's **Parse only** mode follows the same parsing path, hides translation settings, and writes `<paper>.extracted.md`, `.html`, and `.zip`. **Parse and translate** writes `<paper>.translated.*`. Both modes provide downloads and an HTML preview. The latest result shows which mode produced it.
 
 ## Local OCR
 
@@ -137,7 +144,7 @@ For Docker, install the model with `docker compose exec ollama ollama pull glm-o
 
 Decodable equations on a single line are first checked against source Unicode, effective character sizes, and baseline positions to preserve subscripts and superscripts. Other equations are rendered from the original PDF at 4x and 6x resolution, with an 8x check when results disagree. Only white padding is added outside each equation's owned region, avoiding neighboring characters. These transcriptions are compared across resolutions and against readable source digits and variables. Repeated short equations are compared with checked equations in the same PDF, using both whole images and individual glyphs.
 
-Accepted OCR prose is restored as editable text with LaTeX equations, rendered offline as MathML in HTML and Markdown. Original equation images stay in position, and their recognized meaning is provided to translation and summary models. Recovered source regions remain available in a collapsed comparison section. Equations that fail agreement checks remain images and are marked so models do not guess their content. Agreement checks do not guarantee accuracy.
+Accepted OCR prose is restored as editable text with LaTeX equations, rendered offline as MathML in HTML and Markdown. Original equation images stay in position. Translation protects equation markup without supplying a separate equation glossary to HY-MT2. Recovered source regions remain available in a collapsed comparison section. Equations that fail agreement checks remain source images. Agreement checks do not guarantee accuracy.
 
 Tables whose text is drawn as vector outlines cannot be recovered through native text extraction. Their original images remain in the article, with captions above them. Optional OCR adds a collapsible **Searchable table transcription** only after two rendering resolutions agree on cells and spans, and independent CPU OCR supports at least 98% of long words and every plain numeric value. It checks 3x and 4.5x crops, with a 6x retry when needed. Install the `ocr` extra for this independent check. Equations inside cells still require visual review; consistency does not establish correct interpretation or cell assignment. Table images and transcriptions are not translated.
 
@@ -158,7 +165,7 @@ python scripts/audit_corpus.py .tmp/example --output outputs/quality --only Kade
 python scripts/benchmark_quality.py outputs/quality
 ```
 
-The second command evaluates 21 semantic regression checks prepared against the source documents and six independent recalculations of the Bitcoin probability table. These pass rates are not overall paper accuracy. Actual translation and summary quality requires separate evaluation.
+The second command evaluates 21 semantic regression checks prepared against the source documents and six independent recalculations of the Bitcoin probability table. These pass rates are not overall paper accuracy. Actual translation quality requires separate evaluation.
 
 Reproduce the equation OCR comparison in a separate virtual environment to avoid mixing its NumPy/OpenCV versions with the base OCR installation. Use Python 3.12:
 
@@ -182,11 +189,13 @@ paper-localizer extract ".tmp/example/(2001) Pastry_ Scalable, decentralized obj
 paper-localizer run ".tmp/example/(2008) Bitcoin_ A Peer-to-Peer Electronic Cash System.pdf" -o outputs/bitcoin.translated.md
 ```
 
-Figure extraction found eight regions across the nine-page Bitcoin paper and ten figures across the 22-page Pastry paper. Use `run` for the full translation pipeline after installing Ollama and downloading both models.
+Figure extraction found eight regions across the nine-page Bitcoin paper and ten figures across the 22-page Pastry paper. Use `run` for the full translation pipeline after installing Ollama and downloading the translation model.
 
 ## Outputs and resuming interrupted runs
 
-The original abstract and generated summary are displayed separately. The body retains the paper's section and paragraph order. The HTML reading layout draws on IEEE Xplore: a left table of contents, title and author information, abstract, body, figures with captions in context, and references. The header reads `PLoTrans`. Translated documents provide **Original**, **Translation**, and **Parallel view** controls, print styles, and layouts for smaller screens. Markdown follows the same section order with collapsible translations.
+The original abstract is preserved. The body retains the paper's section and paragraph order. The HTML reading layout draws on IEEE Xplore: a left table of contents, title and author information, abstract, body, figures with captions in context, and references. The header reads `PLoTrans`. Translated documents provide **Original**, **Translation**, and **Parallel view** controls, print styles, and layouts for smaller screens. Markdown follows the same section order with collapsible translations.
+
+Translated paper titles, section headings, and contents labels follow the selected reading view. Editable table translations retain the original cell positions, row spans, and column spans. Numeric cells and mathematical values stay unchanged; text cells are translated individually, and repeated cell text is reused within the document. Source table images and their OCR transcriptions retain their original content.
 
 Source glyphs and page geometry repair run-in headings and common two-column reading order, including full-width figures and tables. Heading promotion and spacing repairs require matching source characters. Authors, index terms, and small first-page notes retain separate roles. Continued source paragraphs are rejoined across page/column and model chunk boundaries. Figures, tables, and portraits reserve their space while loading, keeping document positions stable when navigating the table of contents. Complex layouts still need source review.
 
@@ -293,7 +302,7 @@ For optional OCR, agreement at two resolutions also requires agreement with avai
 
 Translation requests replace inline equations with markers such as `[[MATH_0001]]`. Each marker must appear exactly once in the response before its original image is restored. Missing or duplicated markers trigger one retry; persistent failure raises an error instead of saving a translation with missing equations. Chunk boundaries never split image paths.
 
-The base path preserves equations visually without automatic LaTeX conversion or semantic recognition. Summary models cannot read equations preserved only as images. Enable optional document OCR to provide validated transcriptions where available.
+The base path preserves equations visually without automatic LaTeX conversion or semantic recognition. Enable optional document OCR to provide validated transcriptions where available.
 
 ## Limitations and review
 

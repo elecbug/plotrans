@@ -169,7 +169,7 @@ def main() -> None:
                 document = recover_formulas(pdf, attach_figures(pdf, document, args.output), args.output)
             output = args.output / (slug(pdf) + ".md")
             write_article(document, core._document_title(document, pdf.name), pdf.name,
-                          core.make_chunks(core.extract_blocks(document)), None, "", "English", output)
+                          core.make_chunks(core.extract_blocks(document)), None, "English", output)
             result = {"file": pdf.name, "output": output.name,
                       "source_sha256": hashlib.sha256(pdf.read_bytes()).hexdigest(),
                       **metrics(document, raw, output)}

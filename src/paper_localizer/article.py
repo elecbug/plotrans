@@ -35,6 +35,7 @@ class Unit:
     table_data: dict | None = None
     links: list[dict] = field(default_factory=list)
     image_size: tuple[int, ...] = ()
+    translated_table_data: dict | None = None
 
 
 @dataclass
@@ -43,6 +44,7 @@ class Section:
     anchor: str
     level: int = 2
     units: list[Unit] = field(default_factory=list)
+    translation: str = ""
 
 
 @dataclass
@@ -56,9 +58,9 @@ class Article:
     abstract: list[Unit] = field(default_factory=list)
     keywords: list[Unit] = field(default_factory=list)
     sections: list[Section] = field(default_factory=list)
-    summary: str = ""
     translated: bool = False
     title_markup: str = ""
+    title_translation: str = ""
     warnings: list[str] = field(default_factory=list)
     ocr_sources: list[dict] = field(default_factory=list)
     vision_sources: list[dict] = field(default_factory=list)
@@ -80,11 +82,16 @@ def _slug(text: str, used: set[str]) -> str:
 
 
 def build_article(document: dict, title: str, filename: str, chunks, translations=None,
-                  summary: str = "", language: str = "English") -> Article:
+                  language: str = "English") -> Article:
     if translations is not None and len(translations) != len(chunks):
         raise ValueError("The source and translation chunk counts do not match.")
     article = Article(title, filename, document.get("number of pages", "?"), language,
-                      str(document.get("author") or ""), summary=summary, translated=translations is not None)
+                      str(document.get("author") or ""), translated=translations is not None)
+    if issues := document.get('translation issues'):
+        excerpts = sum(issue['kind'] == 'excerpt' for issue in issues)
+        cells = sum(issue['kind'] == 'table-cell' for issue in issues)
+        article.warnings.append(f"Translation validation retained {excerpts} source excerpt(s) and {cells} source table cell(s). "
+                                "See the accompanying .translation.json report for affected locations.")
     if pages := document.get("source image pages"):
         article.warnings.append("Pages " + ", ".join(map(str, pages)) +
                                 " use an undecodable font. Complete source pages are preserved as images; OCR is required to translate their text.")
@@ -101,7 +108,7 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
     current: Section | None = None
     abstract_mode = False
     pending_figure: Unit | None = None
-    used = {"abstract", "summary", "full-text", "figures", "ocr-sources"}
+    used = {"abstract", "full-text", "figures", "ocr-sources"}
     figure_count = 0
     classified_abstract_seen = False
     image_sizes = {asset["source"]: asset.get("pixel size", ()) for asset in document.get("figures", [])}
@@ -116,7 +123,8 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
         target = article.abstract if abstract_mode else current.units if current else article.front
         previous = next((other for other in reversed(target)
                          if unit.paragraph_id and other.paragraph_id == unit.paragraph_id), None)
-        if previous and unit.kind == previous.kind == "text":
+        if (previous and unit.kind == previous.kind == "text"
+                and bool(previous.translation) == bool(unit.translation)):
             previous.source += " " + unit.source
             if unit.translation:
                 previous.translation = (previous.translation + " " + unit.translation).strip()
@@ -126,6 +134,8 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
 
     for index, chunk in enumerate(chunks):
         translated = translations[index] if translations is not None else ""
+        if chunk.reference_section:
+            translated = ""
         if chunk.kind == "frontmatter":
             article.front.append(Unit(chunk.source, pages=chunk.pages))
             pending_figure = None
@@ -144,7 +154,8 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
             pending_figure = None
             continue
         if chunk.kind == "table" and chunk.table_data:
-            append(Unit(chunk.source, translated, kind="native-table", pages=chunk.pages, table_data=chunk.table_data))
+            append(Unit(chunk.source, translated, kind="native-table", pages=chunk.pages, table_data=chunk.table_data,
+                        translated_table_data=document.get('translated native tables',{}).get(str(chunk.index))))
             pending_figure = None
             continue
         if chunk.kind in {"caption", "caption-image"}:
@@ -187,18 +198,23 @@ def build_article(document: dict, title: str, filename: str, chunks, translation
         heading = _HEADING.match(source_parts[0])
         if heading:
             heading_text = heading.group(2)
+            heading_translation = ""
             source_parts.pop(0)
             paragraph_ids.pop(0)
-            if target_parts and _HEADING.match(target_parts[0]): target_parts.pop(0)
+            if target_parts and (translated_heading := _HEADING.match(target_parts[0])):
+                heading_translation = translated_heading.group(2)
+                target_parts.pop(0)
             if _plain(heading_text).casefold() != _plain(title).casefold():
                 if _ABSTRACT.fullmatch(_plain(heading_text)):
                     abstract_mode = True
                 else:
                     level = max(2, min(4, len(heading.group(1))))
                     current = Section(heading_text, _slug(heading_text, used), level)
+                    current.translation = heading_translation
                     article.sections.append(current); abstract_mode = False
             else:
                 article.title_markup = heading_text
+                article.title_translation = heading_translation
             pending_figure = None
         if target_parts and len(target_parts) != len(source_parts):
             pairs = [("\n\n".join(source_parts), "\n\n".join(target_parts), "")]
@@ -287,7 +303,9 @@ def _unit_markdown(unit: Unit) -> str:
     if unit.kind == "native-table" and unit.table_data:
         text = f"<!-- p.{page} -->\n\n" + table_html(unit.table_data["rows"], lambda text: _md_html(text, inline=True))
         if unit.translation:
-            text += "\n\n<details>\n<summary>Translation</summary>\n\n" + render_math(unit.translation) + "\n\n</details>"
+            target = (table_html(unit.translated_table_data['rows'], lambda text: _md_html(text, inline=True))
+                      if unit.translated_table_data else render_math(unit.translation))
+            text += "\n\n<details>\n<summary>Translation</summary>\n\n" + target + "\n\n</details>"
         return text + ("\n\n" + _links_markdown(unit.links) if unit.links else "")
     text = f"<!-- p.{page} -->\n\n" + (unit.source if unit.kind == "code" else render_math(unit.source))
     if unit.translation:
@@ -327,6 +345,8 @@ def _table_transcription(unit: Unit) -> str:
 
 def article_markdown(article: Article) -> str:
     lines = [f"# {article.title_markup or article.title}", ""]
+    if article.title_translation:
+        lines.extend(['<details><summary>Title translation</summary>', '', render_math(article.title_translation), '', '</details>', ''])
     if article.author: lines.extend([article.author, ""])
     lines.extend([f"- Source file: `{article.filename}`", f"- Pages: {article.pages}", ""])
     if article.identifiers:
@@ -334,22 +354,26 @@ def article_markdown(article: Article) -> str:
     for warning in article.warnings:
         lines.extend(["> Parsing note: " + warning, ""])
     if article.front:
-        lines.extend(["<details>", "<summary>Authors and source information</summary>", ""])
-        lines.extend(_unit_markdown(unit) + "\n" for unit in article.front)
-        lines.extend(["</details>", ""])
+        if article.sections or article.abstract:
+            lines.extend(["<details>", "<summary>Authors and source information</summary>", ""])
+            lines.extend(_unit_markdown(unit) + "\n" for unit in article.front)
+            lines.extend(["</details>", ""])
+        else:
+            lines.extend(_unit_markdown(unit) + "\n" for unit in article.front)
     if article.abstract:
         lines.extend(["## Abstract", ""])
         lines.extend(_unit_markdown(unit) + "\n" for unit in article.abstract)
     if article.keywords:
         lines.extend(["## Index terms", ""])
         lines.extend(_unit_markdown(unit) + "\n" for unit in article.keywords)
-    if article.summary: lines.extend(["## Article summary", "", article.summary, ""])
     if article.sections:
         lines.extend(["## Contents", ""])
         lines.extend(f"{'  ' * (section.level - 2)}- [{_plain(section.title)}](#{section.anchor})" for section in article.sections)
         lines.append("")
     for section in article.sections:
         lines.extend([f"{'#' * section.level} {section.title}", ""])
+        if section.translation:
+            lines.extend(['<details><summary>Heading translation</summary>', '', render_math(section.translation), '', '</details>', ''])
         lines.extend(_unit_markdown(unit) + "\n" for unit in section.units)
     if article.ocr_sources:
         lines.extend(["<details>", "<summary>Original pages used for OCR</summary>", ""])
@@ -374,7 +398,9 @@ def _unit_html(unit: Unit) -> str:
     pages = ", ".join(map(str, unit.pages))
     if unit.kind == "native-table" and unit.table_data:
         source = '<div class="native-table-scroll">' + table_html(unit.table_data["rows"], lambda text: _md_html(text, inline=True)) + '</div>'
-        translated = '<div class="translation">' + _md_html(unit.translation) + '</div>' if unit.translation else ""
+        target = ('<div class="native-table-scroll">' + table_html(unit.translated_table_data['rows'], lambda text: _md_html(text, inline=True)) + '</div>'
+                  if unit.translated_table_data else _md_html(unit.translation))
+        translated = '<div class="translation">' + target + '</div>' if unit.translation else ""
         return (f'<div class="reading-pair{" has-translation" if translated else ""}"><div class="source">{source}</div>'
                 + translated + f'</div><span class="page-reference">p.{pages}</span>' + _links_html(unit.links))
     dimensions = f' width="{unit.image_size[0]}" height="{unit.image_size[1]}"' if unit.image_size else ""
@@ -413,12 +439,19 @@ def _pair_html(unit: Unit, caption: bool = False) -> str:
             f'{target}</div><span class="page-reference">p.{page}</span>' + _links_html(unit.links))
 
 
+def _heading_html(source: str, translation: str) -> str:
+    original = _md_html(source, True)
+    if not translation:
+        return original
+    return ('<span class="heading-source">' + original + '</span>'
+            '<span class="heading-translation">' + _md_html(translation, True) + '</span>')
+
+
 def article_html(article: Article, markdown_name: str) -> str:
     navigation = []
     if article.ocr_sources: navigation.append('<a href="#ocr-sources">OCR source pages</a>')
     if article.abstract: navigation.append('<a href="#abstract">Abstract</a>')
-    if article.summary: navigation.append('<a href="#summary">Article summary</a>')
-    navigation.extend(f'<a class="depth-{section.level}" href="#{section.anchor}">{escape(_plain(section.title))}</a>'
+    navigation.extend(f'<a class="depth-{section.level}" href="#{section.anchor}">{_heading_html(_plain(section.title), _plain(section.translation))}</a>'
                       for section in article.sections)
     figures = [unit for section in article.sections for unit in section.units if unit.kind in {"figure", "table-image"}]
     if figures:
@@ -431,11 +464,11 @@ def article_html(article: Article, markdown_name: str) -> str:
                 "".join(_unit_html(unit) for unit in article.abstract) + '</section>') if article.abstract else ""
     keywords = ('<section class="keywords"><h2>Index terms</h2>' +
                 "".join(_unit_html(unit) for unit in article.keywords) + '</section>') if article.keywords else ""
-    summary = ('<section class="summary-card" id="summary"><h2>Article summary</h2>' + _md_html(article.summary) + '</section>') if article.summary else ""
-    front = ('<details class="author-details"><summary>Authors and source information</summary>' +
-             "".join(_unit_html(unit) for unit in article.front) + '</details>') if article.front else ""
+    front = "".join(_unit_html(unit) for unit in article.front)
+    if front and (article.sections or article.abstract):
+        front = '<details class="author-details"><summary>Authors and source information</summary>' + front + '</details>'
     front = "".join('<aside class="parsing-note">' + escape(warning) + '</aside>' for warning in article.warnings) + front
-    body = "".join(f'<section class="paper-section" id="{section.anchor}"><h{section.level}>{_md_html(section.title, True)}</h{section.level}>'
+    body = "".join(f'<section class="paper-section" id="{section.anchor}"><h{section.level}>{_heading_html(section.title, section.translation)}</h{section.level}>'
                    + "".join(_unit_html(unit) for unit in section.units) + '</section>' for section in article.sections)
     if article.ocr_sources:
         body += '<details class="ocr-sources" id="ocr-sources"><summary>Original pages used for OCR</summary>'
@@ -470,19 +503,19 @@ def article_html(article: Article, markdown_name: str) -> str:
 <div class="article-shell"><input class="view-input" type="radio" name="view" id="view-source" {checked_source}>
 <input class="view-input" type="radio" name="view" id="view-translated"><input class="view-input" type="radio" name="view" id="view-both" {checked_both}>
 <header class="article-header"><p class="eyebrow">RESEARCH ARTICLE · {article.pages} PAGES</p>
-<h1 id="article-title">{_md_html(article.title_markup or article.title, True)}</h1><div class="authors">{_md_html(article.author, True)}</div>{_links_html(article.identifiers)}
+<h1 id="article-title">{_heading_html(article.title_markup or article.title, article.title_translation)}</h1><div class="authors">{_md_html(article.author, True)}</div>{_links_html(article.identifiers)}
 <div class="document-meta"><span>{escape(article.filename)}</span><a href="{escape(markdown_name)}" download>Download Markdown ↓</a></div>
 <div class="article-toolbar"><nav>{''.join(top_links)}</nav>
 <div class="view-switch" aria-label="Reading view">{controls}</div></div></header>
 <div class="article-layout"><aside class="contents"><details open><summary>Document contents</summary><nav>{''.join(navigation)}</nav></details></aside>
-<main class="paper-body" id="full-text">{front}{abstract}{keywords}{summary}{body}
-<footer>A local reading edition extracted from the source PDF. Equation images preserve the original notation. Verify translations and summaries against the source.</footer>
+<main class="paper-body" id="full-text">{front}{abstract}{keywords}{body}
+<footer>A local reading edition extracted from the source PDF. Equation images preserve the original notation. Verify translations against the source.</footer>
 </main></div></div></body></html>'''
 
 
-def write_article(document: dict, title: str, filename: str, chunks, translations, summary: str,
+def write_article(document: dict, title: str, filename: str, chunks, translations,
                   language: str, output: Path) -> Path:
-    article = build_article(document, title, filename, chunks, translations, summary, language)
+    article = build_article(document, title, filename, chunks, translations, language)
     output.parent.mkdir(parents=True, exist_ok=True)
     assets = output.parent / "assets"; assets.mkdir(exist_ok=True)
     css = files("paper_localizer").joinpath("assets/article.css").read_text(encoding="utf-8")

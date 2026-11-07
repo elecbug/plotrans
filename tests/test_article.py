@@ -24,6 +24,76 @@ class Audit(HTMLParser):
 
 
 class ArticleTests(unittest.TestCase):
+    def test_reference_entries_ignore_model_generated_page_ranges(self):
+        chunks=make_chunks([Block(1,'heading','## References'),
+                            Block(1,'paragraph','[14] A paper. pp. 2142–2160.')])
+        article=build_article({},'Paper','paper.pdf',chunks,['## 참고문헌\n\n[14] pp. 25–2160.'])
+        html=article_html(article,'paper.md')
+        self.assertIn('2142–2160',html)
+        self.assertNotIn('25–2160',html)
+
+    def test_body_without_an_abstract_or_section_is_not_collapsed_as_author_metadata(self):
+        chunks=[Chunk(1,(1,),'# Short paper\n\nEach node forwards a message to two peers.')]
+        article=build_article({},'Short paper','paper.pdf',chunks,
+                              ['# 짧은 논문\n\n각 노드는 두 개의 피어에게 메시지를 전달합니다.'])
+        html=article_html(article,'paper.md')
+        self.assertNotIn('class="author-details"',html)
+        self.assertIn('각 노드는 두 개의 피어에게 메시지를 전달합니다.',html)
+        from paper_localizer.article import article_markdown
+        self.assertNotIn('<summary>Authors and source information</summary>',article_markdown(article))
+
+    def test_retained_source_segment_is_not_hidden_inside_a_translated_paragraph(self):
+        chunks=[Chunk(1,(1,),'## Body'),
+                Chunk(2,(1,),'First part.',paragraph_ids=('shared',),source_parts=('First part.',)),
+                Chunk(3,(1,),'Retained original.',paragraph_ids=('shared',),source_parts=('Retained original.',))]
+        article=build_article({},'Paper','paper.pdf',chunks,['## 본문','첫 부분.',''])
+        units=article.sections[0].units
+        self.assertEqual(len(units),2)
+        self.assertEqual(units[1].source,'Retained original.')
+        self.assertFalse(units[1].translation)
+        html=article_html(article,'paper.md')
+        self.assertIn('<div class="reading-pair"><div class="source"><p>Retained original.</p>',html)
+
+    def test_original_summary_section_remains_without_a_generated_summary(self):
+        article=build_article({},'Paper','paper.pdf',[Chunk(1,(1,),'## Summary\n\nAn original conclusion.')])
+        html=article_html(article,'paper.md')
+        self.assertIn('An original conclusion.',html)
+        self.assertIn('id="summary"',html)
+        self.assertNotIn('summary-card',html)
+        self.assertNotIn('Article summary',html)
+
+    def test_translated_title_and_section_headings_are_retained_in_exports(self):
+        chunks=[Chunk(1,(1,),'# Network Study'),Chunk(2,(1,),'## 1 Introduction\n\nBody.')]
+        article=build_article({},'Network Study','paper.pdf',chunks,
+                              ['# 네트워크 연구','## 1 서론\n\n본문.'],language='Korean')
+        self.assertEqual(article.title_translation,'네트워크 연구')
+        self.assertEqual(article.sections[0].translation,'1 서론')
+        html=article_html(article,'paper.md')
+        self.assertIn('<span class="heading-source">Network Study</span>',html)
+        self.assertIn('<span class="heading-translation">네트워크 연구</span>',html)
+        self.assertIn('<span class="heading-translation">1 서론</span>',html)
+        from paper_localizer.article import article_markdown
+        md=article_markdown(article)
+        self.assertIn('Title translation',md)
+        self.assertIn('Heading translation',md)
+        self.assertIn('네트워크 연구',md)
+
+    def test_fixed_translated_cells_are_rendered_without_model_generated_table_structure(self):
+        rows=[[{'text':'Header','rowspan':1,'colspan':2,'header':True}],
+              [{'text':'Left','rowspan':1,'colspan':1,'header':False},
+               {'text':'99.9%','rowspan':1,'colspan':1,'header':False}]]
+        target=[[{'text':'머리글','rowspan':1,'colspan':2,'header':True}],
+                [{'text':'왼쪽','rowspan':1,'colspan':1,'header':False},
+                 {'text':'99.9%','rowspan':1,'colspan':1,'header':False}]]
+        doc={'translated native tables':{'1':{'rows':target}}}
+        chunks=[Chunk(1,(1,),'source table','table',table_data={'rows':rows})]
+        article=build_article(doc,'Paper','paper.pdf',chunks,['untrusted model table text'])
+        html=article_html(article,'paper.md')
+        self.assertEqual(html.count('colspan="2"'),2)
+        self.assertIn('머리글',html)
+        self.assertIn('왼쪽',html)
+        self.assertNotIn('untrusted model table text',html)
+
     def test_embedded_ocr_paragraphs_preserve_chunk_ownership(self):
         blocks = [Block(1, "heading", "## Body"),
                   Block(1, "paragraph", "First paragraph.\n\nSecond paragraph.", paragraph_id="original"),
@@ -94,7 +164,7 @@ class ArticleTests(unittest.TestCase):
                             f"## 1 서론\n\n문장 속 수식 {equation}입니다.", "", "그림 1. 라우팅 그림.\n\n후속 설명.",
                             "## 참고문헌\n\n[1] 인용 논문."]
             output = write_article({"number of pages": 1}, "A Routing Study", "paper.pdf", chunks,
-                                   translations, "A grounded summary.", "Korean", root / "paper.md")
+                                   translations, "Korean", root / "paper.md")
             markdown = output.read_text(encoding="utf-8")
             html = output.with_suffix(".html").read_text(encoding="utf-8")
             self.assertIn("## Abstract", markdown)

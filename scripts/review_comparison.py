@@ -183,7 +183,8 @@ def write_review(pdf_path, document, article_path, output):
     output.mkdir(parents=True, exist_ok=True)
     source_dir = output / "source-pages"; source_dir.mkdir(exist_ok=True)
     parsed_dir = output / "parsed-pages"; parsed_dir.mkdir(exist_ok=True)
-    shutil.copytree(article_path.parent/"figs", parsed_dir/"figs", dirs_exist_ok=True)
+    if (article_path.parent/"figs").is_dir():
+        shutil.copytree(article_path.parent/"figs", parsed_dir/"figs", dirs_exist_ok=True)
     pages, sizes = {}, {}
     with pdfium.PdfDocument(pdf_path) as pdf:
         for number in range(1, len(pdf)+1):
@@ -210,7 +211,7 @@ def write_review(pdf_path, document, article_path, output):
                          "source links": [link for link in document.get("source links", [])
                                           if number in link.get("pages", [])]}
         write_article(page_document, f"Parsed source page {number}", pdf_path.name,
-                      core.make_chunks(page_blocks), None, "", "English", parsed_dir/f"page-{number:03d}.md")
+                      core.make_chunks(page_blocks), None, "English", parsed_dir/f"page-{number:03d}.md")
     article = build_article(document, core._document_title(document, pdf_path.name), pdf_path.name, core.make_chunks(blocks))
     graphics = document.get("figures", [])
     report = {"generated_at": datetime.now(timezone.utc).isoformat(), "source_pdf": str(pdf_path.resolve()),

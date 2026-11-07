@@ -9,12 +9,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .core import (OLLAMA_URL, SUMMARY_MODEL, TRANSLATION_MODEL,
+from .core import (OLLAMA_URL, TRANSLATION_MODEL,
                    OllamaClient, ProcessingError, extract_pdf, process_pdf)
 from .ocr import OcrError, OcrOptions, model_paths
 
 
-def doctor(url: str, translation_model: str, summary_model: str, *, ocr: bool = False, skip_ollama: bool = False,
+def doctor(url: str, translation_model: str, *, ocr: bool = False, skip_ollama: bool = False,
            vision_model: str = "") -> int:
     failures = 0
     try:
@@ -46,8 +46,8 @@ def doctor(url: str, translation_model: str, summary_model: str, *, ocr: bool = 
             print(f"[ERROR] {exc}"); failures += 1
     if not skip_ollama:
         try:
-            OllamaClient(url, timeout=10).check_models(translation_model, summary_model)
-            print(f"[OK] Ollama and models: {translation_model}, {summary_model}")
+            OllamaClient(url, timeout=10).check_models(translation_model)
+            print(f"[OK] Ollama translation model: {translation_model}")
         except ProcessingError as exc:
             print(f"[ERROR] {exc}")
             failures += 1
@@ -61,13 +61,12 @@ def doctor(url: str, translation_model: str, summary_model: str, *, ocr: bool = 
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Extract, translate, and summarize PDF papers locally.")
+    parser = argparse.ArgumentParser(description="Parse and translate PDF papers locally.")
     sub = parser.add_subparsers(dest="command", required=True)
-    run = sub.add_parser("run", help="Extract, translate, and summarize a PDF into Markdown, HTML, and ZIP")
+    run = sub.add_parser("run", help="Parse and translate a PDF into Markdown, HTML, and ZIP")
     run.add_argument("pdf", type=Path)
     run.add_argument("-o", "--output", type=Path)
     run.add_argument("--translation-model", default=TRANSLATION_MODEL)
-    run.add_argument("--summary-model", default=SUMMARY_MODEL)
     run.add_argument("--target-language", default="English")
     run.add_argument("--chunk-size", type=int, default=1800)
     run.add_argument("--ollama-url", default=OLLAMA_URL)
@@ -84,7 +83,6 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--vision-ocr-digest", default="", help="Verify the OCR model SHA-256 digest for reproducibility")
     check = sub.add_parser("doctor", help="Check dependencies and model availability")
     check.add_argument("--translation-model", default=TRANSLATION_MODEL)
-    check.add_argument("--summary-model", default=SUMMARY_MODEL)
     check.add_argument("--ollama-url", default=OLLAMA_URL)
     check.add_argument("--ocr", action="store_true", help="Verify local OCR models and checksums")
     check.add_argument("--skip-ollama", action="store_true", help="Check extraction dependencies without Ollama")
@@ -92,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "doctor":
-            return doctor(args.ollama_url, args.translation_model, args.summary_model,ocr=args.ocr,
+            return doctor(args.ollama_url, args.translation_model,ocr=args.ocr,
                           skip_ollama=args.skip_ollama,vision_model=args.vision_ocr_model)
         ocr = OcrOptions(args.ocr_mode,args.ocr_dpi,args.ocr_min_confidence,
                          args.vision_ocr_model, args.vision_ocr_url, args.vision_ocr_digest)
@@ -104,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
         output = args.output or Path("outputs") / f"{args.pdf.stem}.translated.md"
         path = process_pdf(
             args.pdf, output, translation_model=args.translation_model,
-            summary_model=args.summary_model, target_language=args.target_language,
+            target_language=args.target_language,
             chunk_size=args.chunk_size, ollama_url=args.ollama_url,
             ocr=ocr,
             progress=lambda stage, index, total: print(f"{stage}: {index}/{total}", flush=True),

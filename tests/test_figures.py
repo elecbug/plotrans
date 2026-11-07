@@ -161,7 +161,8 @@ class FigureTests(unittest.TestCase):
             def check_models(self, *models): pass
             def chat(self, model, prompt, *, translation=False):
                 self.prompts.append(prompt)
-                return "번역문" if translation else "요약"
+                assert translation
+                return "번역문"
 
         with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
             root = Path(directory)
@@ -175,7 +176,8 @@ class FigureTests(unittest.TestCase):
             self.assertEqual(markdown.count("!["), 2)
             self.assertTrue(all("figs/" not in prompt for prompt in client.prompts))
             with ZipFile(BytesIO(build_bundle(output))) as archive:
-                self.assertEqual(len(archive.namelist()), 5)
+                self.assertEqual(len(archive.namelist()), 6)
+                self.assertIn('result.translation.json',archive.namelist())
                 self.assertIn("result.md", archive.namelist())
                 self.assertIn("result.html", archive.namelist())
                 self.assertIn("assets/article.css", archive.namelist())

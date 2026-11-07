@@ -71,7 +71,7 @@ def main():
                 'accepted':sum(r['accepted'] for r in doc.get('vision ocr',{}).get('regions',[])),
                 'retained_source':sum(not r['accepted'] for r in doc.get('vision ocr',{}).get('regions',[]))} for name,doc in documents.items()}}
     (root/'semantic-checks.json').write_text(json.dumps(result,ensure_ascii=False,indent=2),encoding='utf-8')
-    lines=['# PLoTrans semantic regression review','','These source-checked examples evaluate specific failures found during qualitative reading. They do not measure whole-corpus accuracy. Translation and summarization quality require a separate HY-MT2/Qwen inference review.','', '| Check | Result | Original PDF |','| --- | --- | --- |']
+    lines=['# PLoTrans semantic regression review','','These source-checked examples evaluate specific failures found during qualitative reading. They do not measure whole-corpus accuracy. Translation quality requires a separate HY-MT2 inference review.','', '| Check | Result | Original PDF |','| --- | --- | --- |']
     lines += [f"| {row['case']} | {'PASS' if row['passed'] else 'REVIEW REQUIRED'} | {row['source']} |" for row in checks]
     lines += ['', '## OCR consistency checks', '', 'Accepted means that the configured checks passed. It does not mean that a human verified every symbol.', '', '| Paper | Checked regions | Accepted | Source retained |','| --- | ---: | ---: | ---: |']
     lines += [f"| {name} | {row['checked']} | {row['accepted']} | {row['retained_source']} |" for name,row in result['region_counts'].items()]
