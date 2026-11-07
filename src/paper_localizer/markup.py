@@ -31,6 +31,7 @@ class ImageReference:
     height_em: float = 1.0
     align_em: float = -0.15
     aspect_ratio: float = 1.0
+    region: bool = False
 
 
 def image_reference(match: re.Match) -> ImageReference:
@@ -44,14 +45,29 @@ def image_reference(match: re.Match) -> ImageReference:
         raise ValueError("Unsupported inline image path.")
     style = attrs.get("style", "") or ""
     height = re.search(r"(?:^|;)\s*height\s*:\s*([0-9.]+)em", style)
+    width = re.search(r"(?:^|;)\s*width\s*:\s*([0-9.]+)em", style)
     align = re.search(r"(?:^|;)\s*vertical-align\s*:\s*([-+0-9.]+)em", style)
     try:
         aspect = float(attrs.get("width", "16")) / max(float(attrs.get("height", "16")), 1)
-        return ImageReference(source, attrs.get("alt", "Equation"), True,
-                              float(height.group(1)) if height else 1.0,
-                              float(align.group(1)) if align else -0.15, aspect)
+        region = 'ocr-region' in (attrs.get('class') or '').split()
+        if region and (not math.isfinite(aspect) or aspect <= 0):
+            raise ValueError('Invalid region aspect ratio.')
+        height_em = float(height.group(1)) if height else float(width.group(1))/aspect if region and width else 1.0
+        return ImageReference(source, attrs.get("alt", "Equation"), not region, height_em,
+                              float(align.group(1)) if align else -0.15, aspect, region)
     except (TypeError, ValueError) as exc:
         raise ValueError("Invalid inline image size attributes.") from exc
+
+
+def region_image_tag(source: str, alt: str, height_em: float, aspect_ratio: float) -> str:
+    if not all(math.isfinite(v) and v > 0 for v in (height_em, aspect_ratio)):
+        raise ValueError('Source region dimensions must be finite positive values.')
+    height_em = min(height_em, 200)
+    width_em = min(height_em * aspect_ratio, 2000)
+    return (
+        f'<img src="{escape(source, quote=True)}" alt="{escape(alt, quote=True)}" class="ocr-region" '
+        f'width="{max(1, round(width_em*16))}" height="{max(1, round(height_em*16))}" '
+        f'style="width:{width_em:.3f}em;max-width:100%;height:auto;" />')
 
 
 def inline_image_tag(source: str, alt: str, height_em: float, align_em: float, aspect_ratio: float) -> str:

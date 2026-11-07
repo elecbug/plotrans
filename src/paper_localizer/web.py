@@ -39,7 +39,8 @@ def main() -> None:
         if translate:
             translation_model = st.text_input("Translation model", TRANSLATION_MODEL)
             target_language = st.text_input("Target language", "English")
-        chunk_size = st.slider("Chunk size (characters)", 500, 3500, 1800, 100)
+        chunk_size = st.slider("Target chunk size (characters)", 500, 3500, 1800, 100,
+                               help="Long sentences stay together and may exceed this size.")
         ocr_mode = st.selectbox("OCR mode", ["auto", "off", "force"],
                                 help="auto: detect scans and unreadable text; off: disable OCR; force: process every nonblank page")
         ocr_dpi = st.slider("OCR resolution (DPI)", 96, 400, 216, 8)

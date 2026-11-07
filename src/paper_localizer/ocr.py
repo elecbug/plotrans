@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from html import escape
 import hashlib
 from importlib.resources import files
 import json
@@ -282,6 +283,11 @@ def apply_ocr(pdf_path: Path, document: dict, output_dir: Path, options: OcrOpti
 def preserve_ocr_regions(pdf_path: Path, document: dict, output_dir: Path) -> dict:
     """Retain whole low-confidence/math lines, instead of trusting damaged OCR."""
     nodes = list(_nodes(document)); pending = []
+    page_fonts: dict[int, list[float]] = {}
+    for node in nodes:
+        if (node.get('type') == 'paragraph' and node.get('font') == 'OCR'
+                and not node.get('ocr snapshot') and float(node.get('font size') or 0) > 0):
+            page_fonts.setdefault(node['page number'], []).append(float(node['font size']))
     for node in nodes:
         if not node.get("ocr snapshot") or not node.get("content"):continue
         if pending:
@@ -301,6 +307,7 @@ def preserve_ocr_regions(pdf_path: Path, document: dict, output_dir: Path) -> di
     if not pending: return document
     digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()[:12]
     asset_dir = output_dir/"figs"/digest; asset_dir.mkdir(parents=True,exist_ok=True)
+    source_fonts: dict[int, float] = {}
     with _PDFIUM_LOCK, pdfium.PdfDocument(pdf_path) as pdf:
         for node in pending:
             page_number = node["page number"]; page = pdf[page_number-1]
@@ -312,7 +319,19 @@ def preserve_ocr_regions(pdf_path: Path, document: dict, output_dir: Path) -> di
                 bitmap = page.render(scale=3,crop=(l,b,width-r,height-t),draw_annots=False)
                 image = bitmap.to_pil(); image.save(destination); image.close(); bitmap.close()
                 ref = destination.relative_to(output_dir).as_posix()
-                node["formula snapshot"] = f"![Original notation or uncertain OCR]({ref})"
+                if page_number not in source_fonts:
+                    sizes = [span.font_size for span in _spans(page) if 4 <= span.font_size <= 48]
+                    source_fonts[page_number] = median(sizes) if sizes else 0
+                size = (source_fonts[page_number] or
+                        (median(page_fonts[page_number]) if page_fonts.get(page_number) else float(node.get('font size') or 9)))
+                width_em = (r-l)/size
+                height_em = (t-b)/size
+                # PNGs are rendered at 216 DPI. Use source font geometry so
+                # raster resolution does not enlarge prose in the reading view.
+                node["formula snapshot"] = (
+                    f'<img src="{escape(ref, quote=True)}" alt="Original notation or uncertain OCR" class="ocr-region" '
+                    f'width="{max(1, round(width_em*16))}" height="{max(1, round(height_em*16))}" '
+                    f'style="width:{width_em:.3f}em;max-width:100%;height:auto;" />')
                 document.setdefault("ocr formula assets",[]).append({"source":ref,"page number":page_number,
                     "bounding box":[l,b,r,t],"block":True,"ocr":True})
             finally:

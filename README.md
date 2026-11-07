@@ -20,15 +20,19 @@ Turn PDF papers into structured Markdown and HTML with OpenDataLoader PDF. Parse
 
 The default translation model tag is listed on the [HY-MT2 Ollama distribution page](https://ollama.com/kaelri/hy-mt2). Tencent's [official model page](https://huggingface.co/tencent/Hy-MT2-7B) provides the translation prompt and recommended inference settings. To use another installed tag, set `--translation-model` in the CLI or change the web UI settings.
 
-For dense HY-MT2 tags, the client verifies the installed tokenizer's native tokens and sends a raw native prompt through Ollama's generation API. This bypasses older MT1.x templates packaged with some MT2 tags. Other model architectures keep their chat templates. Requests use an 8192-token context. HY-MT2 receives only the protected source excerpt and translation instructions; free-form paper context and equation glossaries are omitted because they can leak into translated text.
+For dense HY-MT2 tags, the client verifies the installed tokenizer's native tokens and sends a raw native prompt through Ollama's generation API. This bypasses older MT1.x templates packaged with some MT2 tags. Other model architectures keep their chat templates. Requests use an 8192-token context. Free-form paper context and equation glossaries are omitted from HY-MT2 requests because they can leak into translated text. For Korean translations of network and graph papers, source-matched terminology uses Tencent's official glossary prompt format: for example, graph degree means 차수, and network churn means 노드 변동. The glossary is limited to terms present in the current passage and does not apply these meanings to temperature, customer churn, or shipping.
+
+Long excerpts are translated as shorter passages ending at paragraph or complete sentence boundaries. Mathematical markup remains protected, original paragraph separators are restored, and a long individual sentence is kept intact. This also applies when forming document chunks, so the chunk size is a target rather than a strict character limit.
 
 The application has two processing modes: parsing and parsing with translation. It does not generate summaries or require a separate language model. Checkpoints include the translation model digest and inference profile so incompatible results are not reused.
 
-Native tables are translated cell by cell while retaining their source rows, columns and merged cells. Numeric expressions and single-word column identifiers stay unchanged. Titles and section headings retain their translations in HTML, Markdown and the table of contents. Figure labels, table images and searchable OCR transcriptions retain their source language.
+For HY-MT2 Korean translations, recognized organization names also require an exact source match: National Research Foundation of Korea uses 한국연구재단. The abbreviation NRF alone does not trigger this mapping. Grant identifiers retain their original spelling.
+
+Native tables are translated cell by cell while retaining their source rows, columns and merged cells. Numeric expressions and protocol identifiers stay unchanged. Common headers such as Component, Specification, and Metric are translated; Korean uses fixed labels so Metric means 지표 rather than the metric measurement system. Unrecognized single-word column labels retain their source spelling to protect names. Recognized technical headers such as network Churn use the scoped glossary. Explicit physical-server counts with manager and worker roles use node terminology rather than human classifiers in Korean. Titles and section headings retain their translations in HTML, Markdown and the table of contents. Figure labels, table images and searchable OCR transcriptions retain their source language.
 
 Reference sections retain their original text to preserve page ranges, years, titles and identifiers such as DOIs. They are excluded from model requests and remain visible in every reading view. A following appendix or notes section is translated normally.
 
-Translation checks reject incomplete generations, damaged Unicode, omitted numeric literals, altered numeric citation identifiers, and missing or duplicated equation placeholders. Thousands separators are normalized, and words may become digits. If an excerpt or table cell still fails these checks, its source text remains visible and the document displays a note. A `.translation.json` report records affected locations and model identities and is included in the ZIP. Numeric checks compare digit strings. Negation, technical terminology, units, sign interpretation and other semantic errors still require comparison with the original.
+Translation checks reject incomplete generations, damaged Unicode, omitted numeric literals, altered numeric citation identifiers, and missing or duplicated equation placeholders. Thousands separators are normalized, and words may become digits. After two invalid attempts, a passage containing multiple complete sentences is retried sentence by sentence, with the same checks. Sentence splitting avoids double-quoted and parenthetical spans. If an excerpt or table cell still fails, its source text remains visible and the document displays a note. A `.translation.json` report records affected locations and model identities and is included in the ZIP. Numeric checks compare digit strings. Negation, technical terminology, units, sign interpretation and other semantic errors still require comparison with the original.
 
 ## Option 1: Docker Compose (Windows, macOS, Linux)
 
@@ -96,7 +100,7 @@ paper-localizer extract "path/to/paper.pdf" -o "outputs/paper.extracted.md"
 paper-localizer run "path/to/paper.pdf" -o "outputs/paper.translated.md"
 ```
 
-The web UI opens at <http://localhost:8501>. Run `paper-localizer extract --help` or `paper-localizer run --help` for CLI options. Use `--target-language` to change the translation language and `--chunk-size` to adjust the number of characters per model request.
+The web UI opens at <http://localhost:8501>. Run `paper-localizer extract --help` or `paper-localizer run --help` for CLI options. Use `--target-language` to change the translation language and `--chunk-size` to adjust the document chunk size. Long chunks may use multiple model requests at sentence boundaries.
 
 `extract` parses the original document without translation. Specify a `.md` path with `-o`; matching `.html` and `.zip` files are created alongside it. Ollama is unnecessary unless you enable the optional document OCR model.
 
@@ -117,7 +121,7 @@ paper-localizer extract "paper.pdf" -o outputs/native.extracted.md --ocr-mode of
 
 The default resolution is 216 DPI and the minimum confidence is 0.85. Adjust them with `--ocr-dpi` and `--ocr-min-confidence`. `force` processes every nonblank page; `off` preserves source images instead. Docker includes the OCR dependencies. For a CLI installation with OCR, use `pip install -e ".[ocr]"`.
 
-OCR paragraphs use page coordinates to reconstruct reading order and columns. Recognized text is removed from the figure detection mask so an entire scanned page is not classified as one figure. Actual figures are cropped from the original, retaining their internal labels. Lines identified as equations and lines with low confidence are preserved as source images and excluded from translation requests; some surrounding prose on those lines may therefore remain untranslated. All original OCR pages are available in the collapsed **Original pages used for OCR** section of HTML and Markdown and are included in the ZIP.
+OCR paragraphs use page coordinates to reconstruct reading order and columns. Recognized text is removed from the figure detection mask so an entire scanned page is not classified as one figure. Actual figures are cropped from the original, retaining their internal labels. Lines identified as equations and lines with low confidence are preserved as source images and excluded from translation requests; some surrounding prose on those lines may therefore remain untranslated. These region images use PDF font geometry to match the surrounding reading size rather than their raster resolution. All original OCR pages are available in the collapsed **Original pages used for OCR** section of HTML and Markdown and are included in the ZIP.
 
 Raw OCR results are cached in `.ocr-cache/` under the output directory, keyed by PDF content, engine version, and DPI. Paragraph layout and confidence filtering are reapplied when using the cache. OCR confidence is not an accuracy guarantee. The base OCR path does not automatically convert complex equations to LaTeX or reconstruct complex table cells. Local inference for this path was validated on the 13-page Kademlia paper and synthetic scanned PDFs.
 
@@ -300,7 +304,7 @@ Decoded mathematical Unicode characters are combined from UTF-16 pairs before so
 
 For optional OCR, agreement at two resolutions also requires agreement with available native operands, explicit operators, Greek letters, and single-line decimal values. A known symbol may not disappear merely because another glyph is undecodable. When native symbol comparison is unavailable, an additional image check can reject absolute/norm delimiters lacking supporting vertical strokes. This image check only rejects candidates and cannot establish correct transcription. Rejected formulas retain their source images; accepted OCR remains subject to visual review.
 
-Translation requests replace inline equations with markers such as `[[MATH_0001]]`. Each marker must appear exactly once in the response before its original image is restored. Missing or duplicated markers trigger one retry; persistent failure raises an error instead of saving a translation with missing equations. Chunk boundaries never split image paths.
+Translation requests replace inline equations with markers such as `[[MATH_0001]]`. Each marker must appear exactly once in the response before its original image is restored. Missing or duplicated markers trigger a retry, followed by sentence-level retries where possible. Persistent validation failure retains the source excerpt and records its location in the translation report. Chunk boundaries never split image paths or mathematical markup.
 
 The base path preserves equations visually without automatic LaTeX conversion or semantic recognition. Enable optional document OCR to provide validated transcriptions where available.
 
@@ -310,7 +314,7 @@ The base path preserves equations visually without automatic LaTeX conversion or
 - Pages made entirely of undecodable fonts, such as those in Kademlia, use the default OCR path to recover prose. If OCR is disabled or recognizes no text, a source image and explanation are retained. Compare equations and proper names with the source pages.
 - Figure extraction uses rules based on pixels, coordinates, and captions. Review documents with overlapping figures and text or patterned backgrounds against their originals.
 - Native tables with usable cells become Markdown tables. Other tables retain source images; optional document OCR can add checked searchable transcriptions. Check merged cells, row/column assignments, equations, and important values against the PDF.
-- Translations and summaries are generated by local models. Verify important numbers, equations, and citations against the original.
+- Translations are generated by a local model. Verify important numbers, equations, and citations against the original.
 - `outputs/` may contain original and translated paper content. Review it before sharing.
 
 ## Development checks

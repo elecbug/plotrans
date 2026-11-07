@@ -68,12 +68,14 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("-o", "--output", type=Path)
     run.add_argument("--translation-model", default=TRANSLATION_MODEL)
     run.add_argument("--target-language", default="English")
-    run.add_argument("--chunk-size", type=int, default=1800)
+    run.add_argument("--chunk-size", type=int, default=1800,
+                     help="Target document chunk size; complete sentences may exceed it.")
     run.add_argument("--ollama-url", default=OLLAMA_URL)
     extract = sub.add_parser("extract", help="Extract original Markdown, HTML, and ZIP with optional local document OCR")
     extract.add_argument("pdf", type=Path)
     extract.add_argument("-o", "--output", type=Path)
-    extract.add_argument("--chunk-size", type=int, default=1800)
+    extract.add_argument("--chunk-size", type=int, default=1800,
+                         help="Target document chunk size; complete sentences may exceed it.")
     for command in (run, extract):
         command.add_argument("--ocr-mode", choices=("auto","off","force"), default="auto")
         command.add_argument("--ocr-dpi", type=int, default=216)

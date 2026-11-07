@@ -175,7 +175,8 @@ class StructureTests(unittest.TestCase):
             self.assertEqual(len(document['excluded artwork']), 4)
 
     def test_long_paragraph_does_not_gain_breaks_from_model_chunk_size(self):
-        text = ' '.join(f'word{index}' for index in range(180)) + '.'
+        text = ' '.join('Sentence ' + ' '.join(f'word{index}' for index in range(start, start + 30)) + '.'
+                        for start in range(0, 180, 30))
         chunks = make_chunks([Block(1, 'heading', '## Introduction'), Block(1, 'paragraph', text)], 220)
         self.assertGreater(len(chunks), 3)
         article = build_article({}, 'Paper', 'source.pdf', chunks)

@@ -25,3 +25,6 @@ math{font-size:1em}math[display="block"]{display:block;margin:1em auto;max-width
 .native-table-scroll{max-width:100%;overflow-x:auto;margin:16px 0}
 .source img:not(.inline-math),.translation img:not(.inline-math){max-width:100%;height:auto}
 @media print{.math-scroll,.inline-math-scroll{overflow:visible;max-width:none}}
+.equation-block .ocr-region{font-size:17px}
+@media(max-width:700px){.equation-block .ocr-region{font-size:16px}}
+@media print{.equation-block .ocr-region{font-size:11pt}}

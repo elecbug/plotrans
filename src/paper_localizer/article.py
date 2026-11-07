@@ -11,7 +11,7 @@ import re
 
 from markdown_it import MarkdownIt
 
-from .markup import FIGURE_LINK, image_reference, inline_image_tag
+from .markup import FIGURE_LINK, image_reference, inline_image_tag, region_image_tag
 from .math_markup import LATEX, expression, mathml, render_math
 from .tables import table_html
 from .source_links import assign_source_links, web_target
@@ -269,7 +269,9 @@ def _safe_markdown(text: str, math_tokens: dict[str, str] | None = None,
             cursor = match.end()
             continue
         ref = image_reference(match)
-        if ref.inline:
+        if ref.region:
+            parts.append(region_image_tag(ref.source, ref.alt, ref.height_em, ref.aspect_ratio))
+        elif ref.inline:
             parts.append(f'<span class="inline-math-scroll" style="vertical-align:{ref.align_em:.3f}em">' +
                          inline_image_tag(ref.source, ref.alt, ref.height_em, 0, ref.aspect_ratio) + '</span>')
         else:

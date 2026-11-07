@@ -223,7 +223,7 @@ class CoreTests(unittest.TestCase):
         client=Client();result=_translate_native_table(client,'model',rows,'Korean')
         self.assertEqual(rows,original)
         self.assertEqual(len(client.prompts),1)
-        self.assertEqual(result[0],original[0])
+        self.assertEqual([cell['text'] for cell in result[0]],['지표','결과'])
         for row,target in zip(rows,result):
             for cell,translated in zip(row,target):
                 self.assertEqual({k:v for k,v in cell.items() if k!='text'},
@@ -258,6 +258,7 @@ class CoreTests(unittest.TestCase):
         client=Client();target=_translate_native_table(client,TRANSLATION_MODEL,rows,'Korean')
         self.assertEqual(target[1],rows[1])
         self.assertEqual(len(client.prompts),2)
+        self.assertEqual(target[0][0]['text'],'지표')
         self.assertFalse(any('Pastry' in p or 'Viceroy' in p for p in client.prompts))
 
     def test_dedicated_mt2_receives_no_free_form_context_or_marker_glossary(self):

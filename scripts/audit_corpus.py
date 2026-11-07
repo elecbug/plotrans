@@ -180,7 +180,7 @@ def main() -> None:
         result["seconds"] = round(time.monotonic() - start, 2); results.append(result)
         print(f"[{index}/{len(pdfs)}] {pdf.stem[:48]}: " + json.dumps({k:v for k,v in result.items() if k not in {"file", "output"}},ensure_ascii=True), flush=True)
         (args.output / "audit-report.json").write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    lines = ["# Parsing corpus audit", "", "Generated locally from the supplied PDFs. These are extraction previews with local OCR where needed; Ollama translation and summary inference were not run.", "",
+    lines = ["# Parsing corpus audit", "", "Generated locally from the supplied PDFs. These are extraction previews with local OCR where needed; translation was not run.", "",
              "Checks cover asset paths, internal links, duplicate text fully inside equation snapshots and caption ownership. A zero does not prove complete semantic extraction. Review sheets compare selected original pages, figure crops and full source captions.", "",
              "| Paper | Pages | Fig. | Eq./source crops | Captions attached | Text overlaps | Undecoded glyphs |", "|---|---:|---:|---:|---:|---:|---:|"]
     for result in results:

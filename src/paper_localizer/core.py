@@ -209,15 +209,25 @@ def extract_blocks(document: dict) -> list[Block]:
             visit(element)
     continued: list[Block] = []
     for block in blocks:
-        previous = continued[-1] if continued else None
+        anchor = len(continued) - 1
+        while anchor >= 0 and continued[anchor].kind in {'image', 'caption'}:
+            anchor -= 1
+        previous = continued[anchor] if anchor >= 0 else None
         previous_pages = (previous.source_pages or (previous.page,)) if previous else ()
+        floats = continued[anchor + 1:]
+        # A figure-only page may intervene in the middle of a sentence. Finish
+        # that sentence before displaying its floats instead of asking the
+        # translation model to invent the missing continuation.
+        gap = block.page - previous_pages[-1] if previous else 0
+        intervening_pages = {item.page for item in floats}
+        adjacent = gap == 1 or (gap == 2 and previous_pages[-1] + 1 in intervening_pages)
         if (previous and previous.kind == block.kind == "paragraph"
-                and block.page == previous_pages[-1] + 1
+                and adjacent and all(previous_pages[-1] <= item.page <= block.page for item in floats)
                 and len(previous.text) > 50 and re.search(r"[A-Za-z,]$", previous.text)
                 and re.match(r"^[a-z]", block.text)
                 and not FIGURE_LINK.search(previous.text + block.text)):
-            continued[-1] = Block(previous.page, "paragraph", previous.text + " " + block.text,
-                                  source_pages=previous_pages + (block.page,), paragraph_id=previous.paragraph_id)
+            continued[anchor] = Block(previous.page, "paragraph", previous.text + " " + block.text,
+                                      source_pages=previous_pages + (block.page,), paragraph_id=previous.paragraph_id)
         else:
             continued.append(block)
     blocks = front_matter + continued
@@ -229,22 +239,22 @@ def extract_blocks(document: dict) -> list[Block]:
 
 def _split_text(text: str, limit: int) -> list[str]:
     from .math_markup import LATEX
-    if len(LATEX.sub("[[MATH_0001]]", FIGURE_LINK.sub("[[MATH_0001]]", text))) <= limit:
+    opaque: dict[str, str] = {}
+
+    def protect(match: re.Match) -> str:
+        token = f'[[CHUNK_{len(opaque) + 1:04d}]]'
+        opaque[token] = match[0]
+        return token
+
+    protected = LATEX.sub(protect, FIGURE_LINK.sub(protect, text))
+    if len(protected) <= limit:
         return [text]
     parts: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        cut = remaining.rfind(" ", 0, limit + 1)
-        if cut < limit // 2:
-            cut = limit
-        for match in sorted([*FIGURE_LINK.finditer(remaining), *LATEX.finditer(remaining)], key=lambda m:m.start()):
-            if match.start() < cut < match.end():
-                cut = match.start() if match.start() else match.end()
-                break
-        parts.append(remaining[:cut].strip())
-        remaining = remaining[cut:].strip()
-    if remaining:
-        parts.append(remaining)
+    for piece, separator in _translation_segments(protected, limit):
+        for token, original in opaque.items():
+            piece = piece.replace(token, original)
+        if piece.strip():
+            parts.append(piece.strip())
     return parts
 
 
@@ -429,9 +439,12 @@ def parse_pdf(pdf_path: Path, output_dir: Path | None = None, *, ocr: OcrOptions
             raise ProcessingError(f"PDF/OCR, figure, or equation processing failed: {exc}") from exc
 
 
-def _translation_prompt(source: str, target_language: str, context: str = '', requirements: str = '') -> str:
+def _translation_prompt(source: str, target_language: str, context: str = '', requirements: str = '',
+                        terms: tuple[tuple[str, str], ...] = ()) -> str:
     background = ("Research context for terminology only; do not translate this context:\n" + context + "\n\n") if context else ''
-    return background + (
+    glossary = ('Reference the following translations:\n' +
+                '\n'.join(f'{source_term} translates to {target_term}' for source_term, target_term in terms) + '\n\n') if terms else ''
+    return background + glossary + (
         f"Translate the following text into {target_language}. Note that you should only output the "
         "translated result without any additional explanation. Preserve Markdown headings, lists, "
         "table structure, citations, numbers, equations, and reference identifiers exactly. "
@@ -478,6 +491,54 @@ def _citation_identifiers(text: str) -> Counter:
                    for m in re.finditer(r'\[\d+(?:\s*[,;–−-]\s*\d+)*\]', _literal_text(text)))
 
 
+def _sentence_boundaries(text: str) -> list[tuple[int, int]]:
+    boundaries = []
+    for match in re.finditer(r'[.!?]["”’\)\]]*\s+(?=[A-Z“"\(\[])', text):
+        whitespace = re.search(r'\s+$', match[0])
+        start = match.start() + whitespace.start()
+        prefix = text[:start]
+        if (prefix.endswith('..') or prefix.count('“') > prefix.count('”')
+                or prefix.count('"') % 2 or prefix.count('(') > prefix.count(')')
+                or re.search(r'(?:^|\n)\s*\d+\.$', prefix)):
+            continue
+        if re.search(r'\b(?:e\.g|i\.e|et al|Fig|Figs|Eq|Eqs|Sec|Dr|Prof|Mr|Ms|vs|cf|approx|No|pp)\.$', prefix, re.I):
+            continue
+        if re.search(r'(?:^|\s)[A-Z]\.$', prefix):
+            continue
+        boundaries.append((start, match.end()))
+    return boundaries
+
+
+def _translation_segments(text: str, limit: int = 700) -> list[tuple[str, str]]:
+    """Split protected text at paragraphs/sentences, never inside a clause."""
+    if len(text) <= limit:
+        return [(text, '')]
+    result: list[tuple[str, str]] = []
+    start = 0
+    paragraphs = list(re.finditer(r'\n[ \t]*\n(?:[ \t]*\n)*', text))
+    for paragraph_end, next_start in [(m.start(), m.end()) for m in paragraphs] + [(len(text), len(text))]:
+        paragraph = text[start:paragraph_end]
+        boundaries = _sentence_boundaries(paragraph)
+        position = 0
+        while len(paragraph) - position > limit:
+            before = [b for b in boundaries if position < b[0] <= position + limit]
+            after = [b for b in boundaries if b[0] > position + limit]
+            boundary = before[-1] if before else after[0] if after else None
+            if boundary is None:
+                break
+            result.append((paragraph[position:boundary[0]], paragraph[boundary[0]:boundary[1]]))
+            position = boundary[1]
+        if paragraph[position:]:
+            result.append((paragraph[position:], text[paragraph_end:next_start]))
+        elif result:
+            piece, separator = result[-1]
+            result[-1] = (piece, separator + text[paragraph_end:next_start])
+        elif next_start:
+            result.append(('', text[paragraph_end:next_start]))
+        start = next_start
+    return result
+
+
 def _translate_chunk(client: OllamaClient, model: str, source: str, language: str,
                      equation_text: dict[str, str] | None = None, *, context: str = '') -> str:
     equations: dict[str, str] = {}
@@ -502,32 +563,45 @@ def _translate_chunk(client: OllamaClient, model: str, source: str, language: st
     for start, end, token in reversed(replacements):
         protected = protected[:start] + token + protected[end:]
     dedicated = 'hy-mt2' in model.casefold()
-    hints = [context] if context and not dedicated else []
-    if equations and not dedicated:
-        hints.append("Required unchanged placeholders: " + ", ".join(equations))
-    if equation_context and not dedicated:
-        hints.append("Local OCR equation context (keep placeholders unchanged):\n" + json.dumps(equation_context, ensure_ascii=False))
-    source_numbers = _numeric_literals(protected)
-    source_citations = _citation_identifiers(protected)
-    for attempt in range(2):
-        # MT2 translates free-form context and marker lists as source text.
-        # Supply only the protected excerpt to the dedicated translation model.
-        requirements = ('Do not infer missing text or equation values. Keep incomplete sentences and terminal punctuation incomplete. '
-                        'Preserve every equation placeholder exactly once.' if dedicated and attempt else '')
-        prompt = _translation_prompt(protected, language, '' if dedicated else '\n\n'.join(hints), requirements)
-        translated = client.chat(model, prompt, translation=True)
-        found = re.findall(r"\[\[MATH_\d{4}\]\]", translated)
-        if ('\ufffd' not in translated and all(translated.count(token) == 1 for token in equations)
-                and set(found) == set(equations)
-                and not source_numbers - _numeric_literals(translated)
-                and source_citations == _citation_identifiers(translated)):
-            for token, image in equations.items():
-                translated = translated.replace(token, image)
-            return translated
-        hints.append("Required unchanged placeholders: " + ", ".join(equations))
-        if '\ufffd' in translated:
-            hints.append('Return valid Unicode text without replacement characters.')
-    raise TranslationValidationError("The translation model returned damaged characters, omitted numeric literals, or altered citation/equation markers. Reduce the chunk size and retry.")
+    from .terminology import translation_terms
+
+    def translate_piece(piece: str, *, allow_split: bool = True) -> str:
+        expected = {token for token in equations if token in piece}
+        hints = [context] if context and not dedicated else []
+        if expected and not dedicated:
+            hints.append("Required unchanged placeholders: " + ", ".join(sorted(expected)))
+        meanings = {token: value for token, value in equation_context.items() if token in expected}
+        if meanings and not dedicated:
+            hints.append("Local OCR equation context (keep placeholders unchanged):\n" + json.dumps(meanings, ensure_ascii=False))
+        terms = translation_terms(piece, context, language) if dedicated else ()
+        for attempt in range(2):
+            requirements = ('Do not infer missing text or equation values. Keep incomplete sentences and terminal punctuation incomplete. '
+                            'Preserve every equation placeholder exactly once.' if dedicated and attempt else '')
+            prompt = _translation_prompt(piece, language, '' if dedicated else '\n\n'.join(hints), requirements, terms)
+            translated = client.chat(model, prompt, translation=True)
+            found = re.findall(r"\[\[MATH_\d{4}\]\]", translated)
+            if ('\ufffd' not in translated and all(translated.count(token) == 1 for token in expected)
+                    and set(found) == expected
+                    and not _numeric_literals(piece) - _numeric_literals(translated)
+                    and _citation_identifiers(piece) == _citation_identifiers(translated)
+                    and not (terms and re.search(r'Reference the following translations:|\btranslates to\b', translated)
+                             and not re.search(r'Reference the following translations:|\btranslates to\b', piece))):
+                return translated
+            hints.append("Required unchanged placeholders: " + ", ".join(sorted(expected)))
+            if '\ufffd' in translated:
+                hints.append('Return valid Unicode text without replacement characters.')
+        if allow_split:
+            sentences = _translation_segments(piece, limit=1)
+            if len(sentences) > 1:
+                return ''.join((translate_piece(sentence, allow_split=False) if sentence.strip() else sentence) + separator
+                               for sentence, separator in sentences)
+        raise TranslationValidationError("The translation model returned damaged characters, omitted numeric literals, or altered citation/equation markers. Reduce the chunk size and retry.")
+
+    translated = ''.join((translate_piece(piece) if piece.strip() else piece) + separator
+                         for piece, separator in _translation_segments(protected))
+    for token, image in equations.items():
+        translated = translated.replace(token, image)
+    return translated
 
 
 def _translate_native_table(client: OllamaClient, model: str, rows: list[list[dict]], language: str,
@@ -536,6 +610,7 @@ def _translate_native_table(client: OllamaClient, model: str, rows: list[list[di
     """Translate cell values; source geometry and mathematical data stay fixed."""
     from copy import deepcopy
     from .math_markup import LATEX
+    from .terminology import TABLE_HEADERS, table_header_translation, translation_terms
     result = deepcopy(rows)
     cache = cache if cache is not None else {}
     header_depth = max((index + cell['rowspan'] for index, row in enumerate(rows[:3])
@@ -544,8 +619,15 @@ def _translate_native_table(client: OllamaClient, model: str, rows: list[list[di
         for cell_number, cell in enumerate(row, 1):
             source = cell['text']
             literal = LATEX.sub('', FIGURE_LINK.sub('', source)).strip()
+            if ((row_number <= header_depth or cell['header']) and source.strip() == literal
+                    and (header := table_header_translation(literal, language))):
+                cell['text'] = header
+                continue
             if (not re.search(r'[^\W\d_]{2,}', literal)
-                    or (row_number <= header_depth or cell['header']) and re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]*', literal)
+                    or ((row_number <= header_depth or cell['header'])
+                        and re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]*', literal)
+                        and literal.casefold() not in TABLE_HEADERS
+                        and not translation_terms(literal, context, language))
                     or re.fullmatch(r'(?:[A-Za-z][A-Za-z0-9]*\([^()]*\)|\([A-Za-z0-9 +*/^-]+\))(?:\^?\d+)?', literal)
                     or re.fullmatch(r'[a-z]{1,4}[A-Z][A-Za-z0-9]*', literal)):
                 continue
@@ -646,7 +728,11 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
     with pdf_path.open("rb") as file:
         fingerprint = hashlib.file_digest(file, "sha256").hexdigest()
     identity = {
-        "inference_profile": "native-mt2-validate-data-v10",
+        "inference_profile": "native-mt2-scoped-terms-sentences-v15",
+        "terminology_profile": "scientific-korean-v4",
+        "translation_segment_chars": 700,
+        "retry_policy": "two-attempts-then-complete-sentences",
+        "table_header_policy": "korean-label-lexicon-v1-translate-generic-preserve-identifiers",
         "numeric_policy": "preserve-source-literals",
         "citation_policy": "preserve-identifiers",
         "reference_policy": "preserve-original",
@@ -719,7 +805,7 @@ def process_pdf(pdf_path: Path, output_path: Path, *,
     document['translation issues'] = translation_issues
     audit = {key: identity[key] for key in ('inference_profile', 'pdf_sha256', 'translation_model',
                                           'model_digests', 'target_language', 'reference_policy', 'reference_chunks',
-                                          'numeric_policy', 'citation_policy')}
+                                          'numeric_policy', 'citation_policy', 'terminology_profile', 'translation_segment_chars', 'retry_policy', 'table_header_policy')}
     audit.update({'chunks': len(chunks), 'native_tables': len(translated_tables),
                   'issues': translation_issues,
                   'validation_scope': 'Checks generation completion, Unicode, equation markers, source numeric literals and citation identifiers; does not establish semantic accuracy.'})

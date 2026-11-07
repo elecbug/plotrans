@@ -1,7 +1,8 @@
 import unittest
 from unittest.mock import Mock
 
-from paper_localizer.article import article_html,build_article
+from paper_localizer.article import article_html,build_article,_md_html
+from paper_localizer.markup import FIGURE_LINK,image_reference
 from paper_localizer.core import Block,_native_table_rows,extract_blocks,make_chunks
 from paper_localizer.formulas import TextSpan,_plain_text_group
 from paper_localizer.formulas import _merge_overlapping_prose_snapshots
@@ -10,6 +11,32 @@ from paper_localizer.formulas import _reconcile_snapshots
 
 
 class SnapshotExportTests(unittest.TestCase):
+    def test_ocr_source_region_is_not_reclassified_as_an_inline_equation(self):
+        source = ('<img src="figs/source.png" alt="Uncertain source text" class="ocr-region" '
+                  'width="600" height="30" style="width:30em;max-width:100%;height:auto;" />')
+        ref = image_reference(FIGURE_LINK.search(source))
+        self.assertTrue(ref.region)
+        self.assertFalse(ref.inline)
+        html = _md_html(source)
+        self.assertIn('class="ocr-region"',html)
+        self.assertIn('width:30.000em;max-width:100%;height:auto',html)
+        self.assertNotIn('inline-math-scroll',html)
+
+    def test_source_region_reading_size_does_not_depend_on_raster_resolution(self):
+        template = ('<img src="figs/source.png" class="ocr-region" width="{}" height="{}" '
+                    'style="width:30em;max-width:100%;height:auto;" />')
+        self.assertEqual(_md_html(template.format(600,30)),_md_html(template.format(1200,60)))
+
+    def test_source_region_export_normalizes_untrusted_html_attributes(self):
+        source = ('<img src="figs/source.png" alt="Source" class="ocr-region" width="600" height="30" '
+                  'onerror="alert(1)" style="width:30em;position:fixed;" />')
+        html = _md_html(source)
+        self.assertIn('figs/source.png',html)
+        self.assertNotIn('onerror',html)
+        self.assertNotIn('position:fixed',html)
+        oversized = source.replace('width:30em', 'height:1' + '0' * 100 + 'em')
+        self.assertIn('class="ocr-region"',_md_html(oversized))
+
     def test_contained_inline_crop_retires_without_deleting_outside_prose(self):
         owner={'type':'paragraph','content':'Source prose with notation.','bounding box':[30,100,280,140],
                'formula snapshot':'![Source](figs/whole.png)'}
